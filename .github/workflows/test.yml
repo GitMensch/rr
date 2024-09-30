@@ -1,0 +1,16 @@
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+
+      - name: Run script with signal handling
+        timeout-minutes: 1  # kil job instead of workflow
+        run: |
+          bash -c '
+          trap "echo SIGTERM catched && ps -aef && top" SIGTERM;
+          echo "starting process...";
+          sleep 10000;
+          echo "Process ended."
+          '
