@@ -7,6 +7,10 @@
 
 #include <vector>
 
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include "core.h"
 #include "log.h"
 #include "remote_ptr.h"
