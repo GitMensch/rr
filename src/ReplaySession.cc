@@ -822,8 +822,18 @@ Completion ReplaySession::continue_or_step(ReplayTask* t,
         t, RESUME_SINGLESTEP, constraints.stop_before_states);
     handle_unrecorded_cpuid_fault(t, constraints);
   } else {
+    long before_time_count = t->current_user_time();
     bool ok = t->resume_execution(resume_how, RESUME_WAIT_NO_EXIT, tick_request);
     ASSERT(t, ok) << "Tracee died unexpectedly";
+    long after_time_count = t->current_user_time();
+    bool field_ok = (after_time_count >= 0);
+    if (field_ok && after_time_count - before_time_count > 1)
+      LOG(warn) << "Large time_counter change detected!";
+    // Because calls to rrcall_current_time are untraced, we instead
+    // look for changes to preload_globals.rrcall_user_time_counter.
+    if (field_ok && (after_time_count - before_time_count > 0) &&
+        after_time_count == constraints.user_time_target)
+      return INCOMPLETE;
     if (t->stop_sig() == 0) {
       auto type = AddressSpace::rr_page_syscall_from_exit_point(t->arch(), t->ip());
       if (type && type->traced == AddressSpace::UNTRACED) {
@@ -1533,6 +1543,11 @@ Completion ReplaySession::flush_syscallbuf(ReplayTask* t,
     if (t->stop_sig() == PerfCounters::TIME_SLICE_SIGNAL) {
       // This would normally be triggered by constraints.ticks_target but it's
       // also possible to get stray signals here.
+      return INCOMPLETE;
+    }
+
+    if (t->stop_sig() == SIGTRAP && complete == INCOMPLETE &&
+        t->current_user_time() == constraints.user_time_target) {
       return INCOMPLETE;
     }
 

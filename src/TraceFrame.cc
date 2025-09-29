@@ -10,12 +10,13 @@
 namespace rr {
 
 TraceFrame::TraceFrame(FrameTime global_time, pid_t tid, const Event& event,
-                       Ticks tick_count, double monotonic_time)
+                       Ticks tick_count, double monotonic_time, long user_time)
     : global_time(global_time),
       tid_(tid),
       ev(event),
       ticks_(tick_count),
-      monotonic_time_(monotonic_time ? monotonic_time : monotonic_now_sec()) {}
+      monotonic_time_(monotonic_time ? monotonic_time : monotonic_now_sec()),
+      user_time_(user_time) {}
 
 void TraceFrame::dump(FILE* out) const {
   out = out ? out : stdout;
@@ -26,6 +27,7 @@ void TraceFrame::dump(FILE* out) const {
     fprintf(out, "(state:%s) ", state_name(event().Syscall().state));
   }
   fprintf(out, "tid:%d, ticks:%" PRId64 "\n", tid(), ticks());
+  fprintf(out, "user_time:%" PRId64 "\n", user_time());
   if (!event().record_regs()) {
     return;
   }
@@ -41,8 +43,8 @@ void TraceFrame::dump(FILE* out) const {
 void TraceFrame::dump_raw(FILE* out) const {
   out = out ? out : stdout;
 
-  fprintf(out, " %lld %d %d %" PRId64, (long long)time(), tid(), event().type(),
-          ticks());
+  fprintf(out, " %lld %d %d %" PRId64 " %" PRId64, (long long)time(), tid(),
+          event().type(), ticks(), user_time());
   if (!event().record_regs()) {
     fprintf(out, "\n");
     return;

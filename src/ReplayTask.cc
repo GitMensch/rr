@@ -139,6 +139,20 @@ FrameTime ReplayTask::current_frame_time() const {
   return current_trace_frame().time();
 }
 
+bool ReplayTask::watch_user_time() {
+  remote_ptr<long> user_time_counter_ptr =
+    REMOTE_PTR_FIELD(preload_globals, rrcall_user_time_counter);
+  return vm()->add_watchpoint(user_time_counter_ptr,
+                              sizeof(long), WATCH_WRITE);
+}
+
+void ReplayTask::unwatch_user_time() {
+  remote_ptr<long> user_time_counter_ptr =
+    REMOTE_PTR_FIELD(preload_globals, rrcall_user_time_counter);
+  vm()->remove_watchpoint(user_time_counter_ptr, sizeof(long),
+                          WATCH_WRITE);
+}
+
 // Returns number of bytes written (including holes)
 static size_t write_data_with_holes(ReplayTask* t,
                                     const TraceReader::RawDataWithHoles& buf) {

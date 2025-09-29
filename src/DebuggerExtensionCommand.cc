@@ -56,6 +56,15 @@ static SimpleDebuggerExtensionCommand when_tid(
       return string("Current tid: ") + to_string(t->tid);
     });
 
+static SimpleGdbCommand when_user_time(
+    "when-user-time", "Print the current rr user time for the current thread.",
+    [](GdbServer&, Task* t, const vector<string>&) {
+      if (!t->session().is_replaying()) {
+        return GdbCommandHandler::cmd_end_diversion();
+      }
+      return string("Current user time: ") + to_string(t->current_user_time());
+    });
+
 static std::vector<ReplayTimeline::Mark> back_stack;
 static ReplayTimeline::Mark current_history_cp;
 static std::vector<ReplayTimeline::Mark> forward_stack;

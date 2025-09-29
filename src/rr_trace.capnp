@@ -32,6 +32,8 @@ using Tid = Int32;
 using Ticks = Int64;
 # Must be >= 0
 using Fd = Int32;
+# Must be >= 0
+using UserTime = Int64;
 
 # Describes what "ticks" mean in this trace
 enum TicksSemantics {
@@ -332,51 +334,53 @@ struct Frame {
   # The time is the time this record was written, i.e. after the execution
   # of this frame completed.
   monotonicSec @2 :Float64;
+  # Per-task user time (count of calls from user program to rrcall_current_time).
+  userTime @3 :UserTime;
   # Userspace writes performed by this event
-  memWrites @3 :List(MemWrite);
+  memWrites @4 :List(MemWrite);
   # Architecture of this task at this event
   # Determines the format of 'registers' and 'extraRegisters'
-  arch @4 :Arch;
-  registers @5 :Registers;
-  extraRegisters @6 :ExtraRegisters;
+  arch @5 :Arch;
+  registers @6 :Registers;
+  extraRegisters @7 :ExtraRegisters;
   # If the event ends in the syscallbuf, then the address of the 'syscall_hook'
   # function, otherwise zero.
   # For legacy reasons this lives here but it only applies to sched events.
   inSyscallbufSyscallHook @30 :UInt64;
   event :union {
-    instructionTrap @7 :Void;
-    patchSyscall @8 :Void;
-    syscallbufAbortCommit @9 :Void;
-    syscallbufReset @10 :Void;
-    sched @11 :Void;
-    growMap @12 :Void;
-    signal @13 :Signal;
-    signalDelivery @14 :Signal;
-    signalHandler @15 :Signal;
-    exit @16 :Void;
+    instructionTrap @8 :Void;
+    patchSyscall @9 :Void;
+    syscallbufAbortCommit @10 :Void;
+    syscallbufReset @11 :Void;
+    sched @12 :Void;
+    growMap @13 :Void;
+    signal @14 :Signal;
+    signalDelivery @15 :Signal;
+    signalHandler @16 :Signal;
+    exit @17 :Void;
     syscallbufFlush :group {
       # Not used during replay, but affects virtual memory layout so
       # useful for some tools
       # An array of 'mprotect_record's (see preload_interface.h)
-      mprotectRecords @17 :Data;
+      mprotectRecords @18 :Data;
     }
     syscall :group {
       # Linux supports system calls that are of a different architecture to
       # the task's actual architecture (in particular, x86-32 syscalls via
       # int $0x80 in an x86-64 process)
-      arch @18 :Arch;
-      number @19 :Int32;
-      state @20 :SyscallState;
-      failedDuringPreparation @21 :Bool;
+      arch @19 :Arch;
+      number @20 :Int32;
+      state @21 :SyscallState;
+      failedDuringPreparation @22 :Bool;
       extra :union {
-        none @22 :Void;
+        none @23 :Void;
         # Must be >= 0
-        writeOffset @23 :Int64;
-        execFdsToClose @24 :List(Fd);
-        openedFds @25 :List(OpenedFd);
+        writeOffset @24 :Int64;
+        execFdsToClose @25 :List(Fd);
+        openedFds @26 :List(OpenedFd);
         socketAddrs :group {
-          localAddr @28 :Data;
-          remoteAddr @29 :Data;
+          localAddr @29 :Data;
+          remoteAddr @30 :Data;
         }
         # The list of all memory ranges affected by an madvise(). If empty,
         # a successful madvise affected the range indicated by its parameters,
@@ -388,8 +392,8 @@ struct Frame {
         madviseRanges @32 :List(MemRange);
       }
     }
-    patchAfterSyscall @26: Void;
-    patchVsyscall @27: Void;
+    patchAfterSyscall @27: Void;
+    patchVsyscall @28: Void;
     patchTrappingInstruction @31: Void;
   }
 }

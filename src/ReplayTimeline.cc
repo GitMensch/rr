@@ -451,6 +451,41 @@ void ReplayTimeline::seek_to_ticks(FrameTime time, Ticks ticks) {
   }
 }
 
+void ReplayTimeline::seek_to_user_time(FrameTime time, Ticks ticks,
+                                       long target) {
+  seek_to_before_key(MarkKey(time, ticks, ReplayStepKey()));
+  unapply_breakpoints_and_watchpoints();
+
+  while (current->trace_reader().time() < time) {
+    ReplaySession::StepConstraints constraints(RUN_CONTINUE);
+    constraints.stop_at_time = time;
+    ReplayResult result = current->replay_step(constraints);
+    if (result.status != REPLAY_CONTINUE) {
+      FATAL() << "Trace finished before target was reached";
+    }
+  }
+
+  ReplayTask* t = current->current_task();
+  if (t->current_user_time() < target) {
+    // First step using the ticks counter until we enter the skid region
+    ReplaySession::StepConstraints constraints(RUN_CONTINUE);
+    constraints.user_time_target = target;
+    // Set a watchpoint on the user-time counter to ensure we don't
+    // skip updates.
+    bool succeeded = t->watch_user_time();
+    ASSERT(t, succeeded);
+    while (t->current_user_time() < target) {
+      current->replay_step(constraints);
+    }
+    // Remove the watchpoint on the user-time counter.
+    t->unwatch_user_time();
+    // Step the current replay to clear some state set by the
+    // watchpoint.  The replay will still be in
+    // sys_rrcall_current_time after this step.
+    current->replay_step(RUN_SINGLESTEP_FAST_FORWARD);
+  }
+}
+
 ReplayResult ReplayTimeline::replay_step_to_mark(
     const Mark& mark, ReplayStepToMarkStrategy& strategy) {
   ReplayTask* t = current->current_task();

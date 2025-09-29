@@ -61,6 +61,9 @@ public:
   const TraceFrame& current_trace_frame() const;
   FrameTime current_frame_time() const;
 
+  bool watch_user_time();
+  void unwatch_user_time();
+
   /** Restore the next chunk of this frame's saved data from the trace to this. */
   void apply_data_record_from_trace();
   /** Restore all remaining chunks of saved data for the current trace frame. */

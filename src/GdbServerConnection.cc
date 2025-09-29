@@ -1238,6 +1238,13 @@ bool GdbServerConnection::process_vpacket(char* payload) {
       req.restart().param = param;
       LOG(debug) << "next replayer restarting from tick count "
                  << param;
+    } else if (event_str[0] == 'u') {
+      int64_t param = strtoll(event_str.c_str() + 1, &endp, 0);
+      req.restart().type = RESTART_FROM_USER_TIME;
+      req.restart().param_str = event_str.substr(1);
+      req.restart().param = param;
+      LOG(debug) << "next replayer restarting from user-time count "
+                 << param;
     } else {
       req.restart().type = RESTART_FROM_EVENT;
       req.restart().param = strtoll(event_str.c_str(), &endp, 0);

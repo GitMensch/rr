@@ -110,3 +110,7 @@
  * memory location given by the first argument. RAX returns 0.
  */
 #define SYS_rrcall_rdtsc (RR_CALL_BASE + 12)
+/**
+ * Requests the current rr tick.
+ */
+#define SYS_rrcall_current_time (RR_CALL_BASE + 13)

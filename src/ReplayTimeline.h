@@ -180,6 +180,13 @@ public:
   void seek_to_ticks(FrameTime time, Ticks ticks);
 
   /**
+   * Seek the timeline to just after user-time counter value
+   * `user_time` during event `time`.  Also accepts a tick count
+   * 'ticks' to speed up the seeking process.
+   */
+  void seek_to_user_time(FrameTime time, Ticks ticks, long user_time);
+
+  /**
    * Reset the current session to the last checkpointed session before (or at)
    * the mark. Will return at the mark if this mark was explicitly checkpointed
    * previously (and not deleted).

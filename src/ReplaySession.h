@@ -266,9 +266,10 @@ public:
 
   struct StepConstraints {
     explicit StepConstraints(RunCommand command)
-        : command(command), ticks_target(0) {}
+      : command(command), ticks_target(0), user_time_target(0) {}
     RunCommand command;
     Ticks ticks_target;
+    long user_time_target;
     // When the RunCommand is RUN_SINGLESTEP_FAST_FORWARD, stop if the next
     // singlestep would enter one of the register states in this list.
     // RUN_SINGLESTEP_FAST_FORWARD will always singlestep at least once

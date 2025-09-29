@@ -203,6 +203,14 @@ public:
    */
   Ticks tick_count() const { return ticks; }
 
+  long current_user_time() {
+    remote_ptr<long> user_time_counter_ptr =
+      REMOTE_PTR_FIELD(preload_globals, rrcall_user_time_counter);
+    bool field_ok = true;
+    long user_time_count = read_mem(user_time_counter_ptr, &field_ok);
+    return field_ok ? user_time_count : -1;
+  }
+
   /**
    * Return the path of this fd as /proc/<pid>/fd/<fd>
    */

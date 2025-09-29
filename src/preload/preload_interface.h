@@ -309,6 +309,9 @@ struct preload_globals {
   /* The CPU we're bound to, if any; -1 if not bound. Not read during replay. */
   int32_t cpu_binding;
   enum ContextSwitchEventStrategy context_switch_event_strategy;
+
+  /* The usertime, used during display but not contained in old traces. */
+  long rrcall_user_time_counter;
 };
 
 /**

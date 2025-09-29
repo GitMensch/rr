@@ -1758,6 +1758,58 @@ void GdbServer::restart_session(const GdbRequest& req) {
       return;
     }
     timeline_->seek_to_ticks(time, ticks);
+  } else if (req.restart().type == RESTART_FROM_USER_TIME) {
+    long target = req.restart().param;
+    ReplaySession &session = timeline.current_session();
+    Task* task = session.current_task();
+    FrameTime current_time = session.current_frame_time();
+    TraceReader tmp_reader(session.trace_reader());
+    FrameTime last_time = current_time;
+    // We also get a last_ticks value to speed up replay.
+    Ticks last_ticks = tmp_reader.read_frame().ticks();
+    if (task->current_user_time() > target) {
+      tmp_reader.rewind();
+      FrameTime task_time;
+      // EXEC and CLONE reset the ticks counter. Find the first event
+      // where the tuid matches our current task.
+      // We'll always hit at least one CLONE/EXEC event for a task
+      // (we can't debug the time before the initial exec)
+      // but set this to 0 anyway to silence compiler warnings.
+      FrameTime user_start_time = 0;
+      while (true) {
+        TraceTaskEvent r = tmp_reader.read_task_event(&task_time);
+        if (task_time >= current_time) {
+          break;
+        }
+        if (r.type() == TraceTaskEvent::CLONE || r.type() == TraceTaskEvent::EXEC) {
+          if (r.tid() == task->tuid().tid()) {
+            user_start_time = task_time;
+          }
+        }
+      }
+      // Forward the frame reader to the current event
+      last_time = user_start_time;
+      while (true) {
+        TraceFrame frame = tmp_reader.read_frame();
+        if (frame.time() >= user_start_time) {
+          break;
+        }
+      }
+    }
+    while (true) {
+      if (tmp_reader.at_end()) {
+        cout << "No event found matching specified user-time target.";
+        dbg->notify_restart_failed();
+        return;
+      }
+      TraceFrame frame = tmp_reader.read_frame();
+      if (frame.user_time() >= target) {
+        break;
+      }
+      last_time = frame.time();
+      last_ticks = frame.ticks();
+    }
+    _timeline->seek_to_user_time(last_time, last_ticks, target);
   }
 
   interrupt_pending = true;

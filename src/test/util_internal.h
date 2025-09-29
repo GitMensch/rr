@@ -23,4 +23,8 @@ void rr_freeze_tid(pid_t tid, int freeze) {
   test_assert(err == 0 && "Failed to freeze tid");
 }
 
+int rr_current_time(void) {
+  return syscall(SYS_rrcall_current_time, 0, 0, 0, 0, 0, 0);
+}
+
 #endif /* RRUTIL_INTERNAL_H */
