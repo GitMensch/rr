@@ -5,7 +5,7 @@
 
 #define RR_PAGE_ADDR 0x70000000
 
-long checked_ptrace(enum __ptrace_request request, pid_t pid, void* addr,
+long checked_ptrace(int request, pid_t pid, void* addr,
                     void* data) {
   long ret = ptrace(request, pid, addr, data);
   test_assert(ret != -1);
@@ -76,7 +76,7 @@ void munmap_remote(pid_t child, uintptr_t start, size_t size) {
 #elif defined(__aarch64__)
   test_assert(regs.regs[0] == 0);
 #else
-#error unuspported architecture
+#error unsupported architecture
 #endif
 }
 
@@ -148,6 +148,12 @@ int main(void) {
   wret = waitpid(child, &status, __WALL | WSTOPPED);
   test_assert(wret == child);
   test_assert(status >> 8 == (SIGTRAP | (PTRACE_EVENT_EXEC << 8)));
+
+  // Continue to syscall exit event
+  checked_ptrace(PTRACE_SYSCALL, child, 0, 0);
+  wret = waitpid(child, &status, __WALL | WSTOPPED);
+  test_assert(wret == child);
+  test_assert(WSTOPSIG(status) == (SIGTRAP | 0x80));
 
   // On kernels with aggressive ASLR, the executable mapping may
   // not be in the same place that it is now. Find it again.

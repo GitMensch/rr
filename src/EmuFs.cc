@@ -4,10 +4,18 @@
 
 #include <syscall.h>
 #include <sys/mman.h>
+#include <linux/fs.h>
 
 #include <fstream>
 #include <sstream>
 #include <string>
+
+// muslc defines those, but we want a typedef instead
+#if defined(loff_t)
+typedef loff_t __musl_loff_t;
+#undef loff_t
+typedef __musl_loff_t loff_t;
+#endif
 
 #include "AddressSpace.h"
 #include "ReplaySession.h"
@@ -80,7 +88,7 @@ EmuFile::shr_ptr EmuFile::clone(EmuFs& owner) {
         break;
       }
       if (uint64_t(ret) <= offset) {
-        FATAL() << "Zero sized hole?";
+        FATAL() << "Zero sized hole? Got " << ret << " expected " << offset;
       }
       // Skip the hole
       offset = ret;

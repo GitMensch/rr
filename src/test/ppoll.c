@@ -6,6 +6,18 @@
 
 #define NUM_ITERATIONS 10
 
+static int our_ualarm(useconds_t value, useconds_t interval)
+{
+  struct itimerval timer;
+
+  timer.it_value.tv_sec = 0;
+  timer.it_value.tv_usec = value;
+  timer.it_interval.tv_sec = 0;
+  timer.it_interval.tv_usec = interval;
+
+  return setitimer(ITIMER_REAL, &timer, NULL);
+}
+
 static void handle_sig(__attribute__((unused)) int sig) {
   sigset_t after_sigset;
   int ret = sigprocmask(SIG_BLOCK, NULL, &after_sigset);
@@ -39,19 +51,23 @@ int main(void) {
   pfd.events = POLLIN;
   for (i = 0; i < NUM_ITERATIONS; i++) {
     int ret;
+    sigset_t before_sigset;
+    sigset_t sigalrm_blocked_sigset;
+    sigemptyset(&sigalrm_blocked_sigset);
+    sigaddset(&sigalrm_blocked_sigset, SIGALRM);
+    /* Block SIGALRM before we call our_ualarm because we don't want it
+       to go off early. */
+    ret = sigprocmask(SIG_SETMASK, &sigalrm_blocked_sigset, &before_sigset);
+    test_assert(ret == 0);
+    test_assert(!sigismember(&before_sigset, SIGALRM));
 
     atomic_printf("iteration %d\n", i);
     if (i % 2 == 0) {
-      ualarm(100000, 0);
+      our_ualarm(100000, 0);
     } else if (fork() == 0) {
       usleep(100000);
       return 0;
     }
-
-    sigset_t before_sigset;
-    ret = sigprocmask(SIG_BLOCK, NULL, &before_sigset);
-    test_assert(ret == 0);
-    test_assert(!sigismember(&before_sigset, SIGALRM));
 
     t.tv_sec = 1;
     t.tv_nsec = 0;
@@ -70,7 +86,7 @@ int main(void) {
 
     /* Validate that the signal mask got reset */
     sigset_t after_sigset;
-    ret = sigprocmask(SIG_BLOCK, NULL, &after_sigset);
+    ret = sigprocmask(SIG_SETMASK, &before_sigset, &after_sigset);
     test_assert(ret == 0);
     test_assert(!sigismember(&after_sigset, SIGCHLD));
   }

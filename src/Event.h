@@ -3,12 +3,15 @@
 #ifndef RR_EVENT_H_
 #define RR_EVENT_H_
 
+#include <sys/types.h>
+
 #include <memory>
 #include <ostream>
 #include <stack>
 #include <string>
 #include <vector>
 
+#include "MemoryRange.h"
 #include "Registers.h"
 #include "core.h"
 #include "kernel_abi.h"
@@ -108,13 +111,31 @@ struct DeschedEvent {
 };
 
 struct PatchSyscallEvent {
-  PatchSyscallEvent() : patch_after_syscall(false) {}
+  PatchSyscallEvent() : patch_trapping_instruction(false),
+    patch_after_syscall(false), patch_vsyscall(false) {}
+  // If true, this patch is for a trapping instruction, not a real syscall
+  bool patch_trapping_instruction;
   // If true, this patch event comes after a syscall (whereas usually they
   // come before). We assume the trace has put us in the correct place
   // and don't try to execute any code to reach this event.
   bool patch_after_syscall;
-  // It true, this patch is for the caller of a vsyscall entry point
+  // If true, this patch is for the caller of a vsyscall entry point
   bool patch_vsyscall;
+};
+
+/**
+ * Sched events track points at which context switches happen that are not
+ * otherwise associated with an rr event.
+ * Also used to record the point at which a tracee is SIGKILLed, which
+ * may require special handling if in the syscallbuf.
+ */
+struct SchedEvent {
+  SchedEvent(remote_code_ptr in_syscallbuf_syscall_hook)
+    : in_syscallbuf_syscall_hook(in_syscallbuf_syscall_hook) {}
+  // If this SchedEvent represents the tracee being SIGKILLed,
+  // and syscall buffering is enabled, this contains the address
+  // of the 'syscall_hook' function, otherwise zero.
+  remote_code_ptr in_syscallbuf_syscall_hook;
 };
 
 struct SyscallbufFlushEvent {
@@ -214,13 +235,18 @@ struct SyscallEvent {
         switchable(PREVENT_SWITCH),
         is_restart(false),
         failed_during_preparation(false),
-        in_sysemu(false) {}
+        in_sysemu(false),
+        should_retry_patch(false) {}
 
   std::string syscall_name() const { return rr::syscall_name(number, arch()); }
 
   SupportedArch arch() const { return arch_; }
   /** Change the architecture for this event. */
   void set_arch(SupportedArch a) { arch_ = a; }
+
+  bool is_exec() const {
+    return is_execve_syscall(number, arch()) || is_execveat_syscall(number, arch());
+  }
 
   SupportedArch arch_;
   // The original (before scratch is set up) arguments to the
@@ -231,12 +257,16 @@ struct SyscallEvent {
   // record for that syscall.
   remote_ptr<const struct syscallbuf_record> desched_rec;
 
-  // Extra data for specific syscalls. Only used for exit events currently.
-  // -1 to indicate there isn't one
+  // Extra data for specific syscalls.
+  // -1 to indicate there isn't a write offset.
   int64_t write_offset;
   std::vector<int> exec_fds_to_close;
   std::vector<OpenedFd> opened;
   std::shared_ptr<std::array<typename NativeArch::sockaddr_storage, 2>> socket_addrs;
+  // Memory ranges affected by an madvise(). If empty, a successful madvise affected
+  // the range indicated by its parameters, and an unsuccessful madvise affected
+  // nothing.
+  std::vector<MemoryRange> madvise_ranges;
 
   SyscallState state;
   // Syscall number.
@@ -252,6 +282,8 @@ struct SyscallEvent {
   bool failed_during_preparation;
   // Syscall is being emulated via PTRACE_SYSEMU.
   bool in_sysemu;
+  // True if we should retry patching on exit from this syscall
+  bool should_retry_patch;
 };
 
 struct syscall_interruption_t {
@@ -261,7 +293,7 @@ static const syscall_interruption_t interrupted;
 
 /**
  * Sum type for all events (well, a C++ approximation thereof).  An
- * Event always has a definted EventType.  It can be down-casted to
+ * Event always has a defined EventType.  It can be down-casted to
  * one of the leaf types above iff the type tag is correct.
  */
 struct Event {
@@ -293,6 +325,15 @@ struct Event {
   const PatchSyscallEvent& PatchSyscall() const {
     DEBUG_ASSERT(EV_PATCH_SYSCALL == event_type);
     return patch;
+  }
+
+  SchedEvent& Sched() {
+    DEBUG_ASSERT(is_sched_event());
+    return sched_;
+  }
+  const SchedEvent& Sched() const {
+    DEBUG_ASSERT(is_sched_event());
+    return sched_;
   }
 
   SyscallbufFlushEvent& SyscallbufFlush() {
@@ -332,7 +373,13 @@ struct Event {
    * Return true if this is one of the indicated type of events.
    */
   bool is_signal_event() const;
+  bool is_sched_event() const {
+    return event_type == EV_SCHED;
+  }
   bool is_syscall_event() const;
+  bool is_syscallbuf_flush_event() const {
+    return event_type == EV_SYSCALLBUF_FLUSH;
+  }
 
   /** Return a string describing this. */
   std::string str() const;
@@ -356,9 +403,14 @@ struct Event {
     auto ev = Event(EV_PATCH_SYSCALL);
     ev.PatchSyscall().patch_after_syscall = false;
     ev.PatchSyscall().patch_vsyscall = false;
+    ev.PatchSyscall().patch_trapping_instruction = false;
     return ev;
   }
-  static Event sched() { return Event(EV_SCHED); }
+  static Event sched() {
+    auto ev = Event(EV_SCHED);
+    ev.Sched().in_syscallbuf_syscall_hook = remote_code_ptr();
+    return ev;
+  }
   static Event seccomp_trap() { return Event(EV_SECCOMP_TRAP); }
   static Event syscallbuf_abort_commit() {
     return Event(EV_SYSCALLBUF_ABORT_COMMIT);
@@ -375,6 +427,7 @@ private:
   union {
     DeschedEvent desched;
     PatchSyscallEvent patch;
+    SchedEvent sched_;
     SignalEvent signal;
     SyscallEvent syscall;
     SyscallbufFlushEvent syscallbuf_flush;

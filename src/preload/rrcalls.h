@@ -73,6 +73,15 @@
  * presence of absence of rr.
  */
 #define SYS_rrcall_check_presence (RR_CALL_BASE + 8)
+   /*
+    * If `arg1` is `RRCALL_CHECK_SYSCALLBUF_USED_OR_DISABLED`,
+    * SYS_rrcall_check_presence returns 0 only if
+    * 1) The syscallbuf was used to service the syscall
+    * 2) The syscallbuf is disabled
+    *
+    * Otherwise returns ENOTSUP.
+    */
+    #define RRCALL_CHECK_SYSCALLBUF_USED_OR_DISABLED 1
 /**
  * Requests that rr detach from this process and re-create outside of its
  * process tree, such that it may run without seccomp.
@@ -85,6 +94,23 @@
  */
 #define SYS_rrcall_arm_time_slice (RR_CALL_BASE + 10)
 /**
+ * Use as
+ *
+ *  int rr_freeze_tid(pid_t tid, int freeze) {
+ *      return syscall(SYS_rrcall_freeze_tid, tid, freeze, 0, 0, 0, 0); }
+ *
+ * With `freeze=1`, requests that rr's Scheduler not schedule task `tid` again
+ * until unfrozen using `rr_freeze_tid(tid, 0)`. Note that kernel scheduling
+ * behavior is unaffected. Used for testing Scheduler-sensitive scenarios.
+ */
+#define SYS_rrcall_freeze_tid (RR_CALL_BASE + 11)
+/**
+ * Requests a simulated (buffered) RDTSC.
+ * The RDTSC value is returned as a 64-bit value stored in the
+ * memory location given by the first argument. RAX returns 0.
+ */
+#define SYS_rrcall_rdtsc (RR_CALL_BASE + 12)
+/**
  * Requests the current rr tick.
  */
-#define SYS_rrcall_current_time (RR_CALL_BASE + 11)
+#define SYS_rrcall_current_time (RR_CALL_BASE + 13)

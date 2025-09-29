@@ -52,7 +52,9 @@
 #include <linux/videodev2.h>
 #include <linux/vt.h>
 #include <linux/wireless.h>
+#ifdef MQUEUE_H
 #include <mqueue.h>
+#endif
 #include <poll.h>
 #include <pthread.h>
 #include <pty.h>
@@ -69,13 +71,16 @@
 #include <sys/auxv.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#ifdef FANOTIFY_H
 #include <sys/fanotify.h>
+#endif
 #include <sys/file.h>
 #include <sys/fsuid.h>
 #include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
 #include <sys/msg.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
@@ -112,21 +117,12 @@
 // X86 specific headers
 #if defined(__i386__) || defined(__x86_64__)
 #include <asm/prctl.h>
-#include <sys/io.h>
 #include <x86intrin.h>
 #endif
 
-#if defined(__i386__)
-#include "SyscallEnumsForTestsX86.generated"
-#elif defined(__x86_64__)
-#include "SyscallEnumsForTestsX64.generated"
-#elif defined(__aarch64__)
-#include "SyscallEnumsForTestsGeneric.generated"
-#else
-#error Unknown architecture
-#endif
-
 #include <rr/rr.h>
+
+#include "util_syscall.h"
 
 typedef unsigned char uint8_t;
 
@@ -178,27 +174,30 @@ inline static int atomic_puts(const char* str) {
 #define printf(...) USE_atomic_printf_INSTEAD
 #define puts(...) USE_atomic_puts_INSTEAD
 
-inline static int check_cond(int cond) {
+inline static int atomic_assert(int cond, const char *str,
+				const char *file, const int line) {
   if (!cond) {
-    atomic_printf("FAILED: errno=%d (%s)\n", errno, strerror(errno));
-  }
-  return cond;
-}
-
-inline static int atomic_assert(int cond, const char *str) {
-  if (!check_cond(cond)) {
-    atomic_printf("FAILED: !%s\n", str);
+    atomic_printf("FAILED at %s:%d: !(%s) errno:%d (%s)\n", file, line, str,
+		  errno, strerror(errno));
     raise(SIGABRT);
   }
   return 1;
 }
 
-#define test_assert(cond) atomic_assert(cond, #cond)
+#define test_assert(cond) atomic_assert(cond, #cond, __FILE__, __LINE__)
 
 /**
  * Return the calling task's id.
  */
 inline static pid_t sys_gettid(void) { return syscall(SYS_gettid); }
+
+/**
+ * get the current cpu/node
+ */
+inline static int sys_getcpu(unsigned int* cpu, unsigned int* node) {
+  /* The 'tcache' parameter is unused in all kernels rr works on */
+  return syscall(SYS_getcpu, cpu, node, (void*)0);
+}
 
 /**
  * Ensure that |len| bytes of |buf| are the same across recording and
@@ -220,6 +219,16 @@ inline static void check_data(void* buf, size_t len) {
  */
 inline static uint64_t rdtsc(void) { return __rdtsc(); }
 #endif
+
+inline static void trigger_timer_counter_trap(void) {
+#if defined(__i386__) || defined(__x86_64)
+  rdtsc();
+#elif defined(__aarch64__)
+  __asm__ __volatile__("mrs xzr, cntvct_el0");
+#else
+#error "Unknown architecture"
+#endif
+}
 
 /**
  * Perform some syscall that writes an event, i.e. is not syscall-buffered.
@@ -247,7 +256,7 @@ inline static size_t ceil_page_size(size_t size) {
  * an mrs instruction, which will cause SIGILL if the system
  * register used isn't accessible in EL0. Which register we
  * use doesn't matter here, but we should one that is neither
- * unsused and might do something else in the future, nor one
+ * unused and might do something else in the future, nor one
  * that the kernel or a hypervisor might emulate in the future.
  * Here we use `S3_6_C15_C8_0` which is a microcode patching
  * register and only available in EL3. Accessing it here
@@ -285,9 +294,18 @@ inline static void* allocate_guard(size_t size, char value) {
  * (of size 'size') is still valid.
  */
 inline static void verify_guard(__attribute__((unused)) size_t size, void* p) {
+  int tmp_errno = errno;
   char* cp = (char*)p;
   test_assert(
       memcmp(cp - sizeof(GUARD_VALUE), &GUARD_VALUE, sizeof(GUARD_VALUE)) == 0);
+
+  /* Create a "checksum" from the memory and get it checked at syscall boundary. */
+  int verify_guard_checksum = 0;
+  for (size_t i = 0; i < size; i++) {
+      verify_guard_checksum += ((unsigned char*)p)[i];
+  }
+  syscall(-1, verify_guard_checksum);
+  errno = tmp_errno;
 }
 
 /**
@@ -303,6 +321,16 @@ inline static void free_guard(size_t size, void* p) {
 }
 
 inline static void crash_null_deref(void) { *(volatile int*)NULL = 0; }
+
+inline static void chdir_nontmp_workdir(void) {
+  const char* nontmp_workdir = getenv("NONTMP_WORKDIR");
+  test_assert(nontmp_workdir && "NONTMP_WORKDIR environment variable not set");
+  /* Could be the empty string if the original directory from which tests were run
+     is a read-only directory */
+  if (*nontmp_workdir) {
+    test_assert(chdir(nontmp_workdir) == 0);
+  }
+}
 
 static char* trim_leading_blanks(char* str) {
   char* trimmed = str;
@@ -383,6 +411,10 @@ inline static SyscallWrapper get_spurious_desched_syscall(void) {
   return ret ? ret : default_syscall_wrapper;
 }
 
+/* Old systems don't have these functions, re-define using the syscall */
+#define tgkill(tgid, tid, sig) \
+  syscall(SYS_tgkill, (int)(tgid), (int)(tid), (int)(sig))
+
 #define ALLOCATE_GUARD(p, v) p = allocate_guard(sizeof(*p), v)
 #define VERIFY_GUARD(p) verify_guard(sizeof(*p), p)
 #define FREE_GUARD(p) free_guard(sizeof(*p), p)
@@ -407,6 +439,14 @@ inline static SyscallWrapper get_spurious_desched_syscall(void) {
 #define RR_KCMP_FILE 0
 #define RR_KCMP_FILES 2
 
+/* Old systems don't have linux/openat2.h */
+struct open_how {
+	__u64 flags;
+	__u64 mode;
+	__u64 resolve;
+};
+#define RESOLVE_BENEATH	0x08
+
 /* Old systems don't have these */
 #ifndef TIOCGPKT
 #define TIOCGPKT _IOR('T', 0x38, int)
@@ -423,6 +463,45 @@ inline static SyscallWrapper get_spurious_desched_syscall(void) {
 
 #ifndef MADV_FREE
 #define MADV_FREE 8
+#endif
+#ifndef MADV_DONTDUMP
+#define MADV_DONTDUMP 16
+#endif
+#ifndef MADV_DODUMP
+#define MADV_DODUMP 17
+#endif
+#ifndef MADV_WIPEONFORK
+#define MADV_WIPEONFORK 18
+#endif
+#ifndef MADV_KEEPONFORK
+#define MADV_KEEPONFORK 19
+#endif
+#ifndef MADV_SOFT_OFFLINE
+#define MADV_SOFT_OFFLINE 101
+#endif
+#ifndef MADV_COLD
+#define MADV_COLD 20
+#endif
+#ifndef MADV_PAGEOUT
+#define MADV_PAGEOUT 21
+#endif
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+#ifndef MADV_DONTNEED_LOCKED
+#define MADV_DONTNEED_LOCKED 24
+#endif
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+#ifndef MADV_GUARD_INSTALL
+#define MADV_GUARD_INSTALL 102
+#endif
+#ifndef MADV_GUARD_REMOVE
+#define MADV_GUARD_REMOVE 103
 #endif
 
 #ifndef F_OFD_GETLK
@@ -471,6 +550,85 @@ inline static SyscallWrapper get_spurious_desched_syscall(void) {
 #endif
 #ifndef PR_SPEC_FORCE_DISABLE
 #define PR_SPEC_FORCE_DISABLE 8
+#endif
+#ifndef PR_SET_VMA
+#define PR_SET_VMA 0x53564d41
+#endif
+#ifndef PR_SET_VMA_ANON_NAME
+#define PR_SET_VMA_ANON_NAME 0
+#endif
+#ifndef PR_GET_AUXV
+#define PR_GET_AUXV 0x41555856
+#endif
+
+#ifndef BLKGETDISKSEQ
+#define BLKGETDISKSEQ _IOR(0x12,128,__u64)
+#endif
+
+#ifndef MREMAP_DONTUNMAP
+#define MREMAP_DONTUNMAP 4
+#endif
+
+struct rseq {
+  uint32_t cpu_id_start;
+  uint32_t cpu_id;
+  uint64_t rseq_cs;
+  uint32_t flags;
+} __attribute__((aligned(32)));
+
+struct rseq_cs {
+  uint32_t version;
+  uint32_t flags;
+  uint64_t start_ip;
+  uint64_t post_commit_offset;
+  uint64_t abort_ip;
+} __attribute__((aligned(32)));
+
+enum {
+  RR_BPF_MAP_CREATE,
+  RR_BPF_MAP_LOOKUP_ELEM,
+  RR_BPF_MAP_UPDATE_ELEM,
+  RR_BPF_MAP_DELETE_ELEM,
+  RR_BPF_MAP_GET_NEXT_KEY,
+  RR_BPF_PROG_LOAD,
+  RR_BPF_OBJ_PIN,
+  RR_BPF_OBJ_GET,
+  RR_BPF_PROG_ATTACH,
+  RR_BPF_PROG_DETACH,
+  RR_BPF_PROG_TEST_RUN,
+  RR_BPF_PROG_GET_NEXT_ID,
+  RR_BPF_MAP_GET_NEXT_ID,
+  RR_BPF_PROG_GET_FD_BY_ID,
+  RR_BPF_MAP_GET_FD_BY_ID,
+  RR_BPF_OBJ_GET_INFO_BY_FD,
+  RR_BPF_PROG_QUERY,
+  RR_BPF_RAW_TRACEPOINT_OPEN,
+  RR_BPF_BTF_LOAD,
+  RR_BPF_BTF_GET_FD_BY_ID,
+  RR_BPF_TASK_FD_QUERY,
+  RR_BPF_MAP_LOOKUP_AND_DELETE_ELEM,
+  RR_BPF_MAP_FREEZE,
+  RR_BPF_BTF_GET_NEXT_ID,
+  RR_BPF_MAP_LOOKUP_BATCH,
+  RR_BPF_MAP_LOOKUP_AND_DELETE_BATCH,
+  RR_BPF_MAP_UPDATE_BATCH,
+  RR_BPF_MAP_DELETE_BATCH,
+  RR_BPF_LINK_CREATE,
+  RR_BPF_LINK_UPDATE,
+  RR_BPF_LINK_GET_FD_BY_ID,
+  RR_BPF_LINK_GET_NEXT_ID,
+  RR_BPF_ENABLE_STATS,
+  RR_BPF_ITER_CREATE,
+  RR_BPF_LINK_DETACH,
+  RR_BPF_PROG_BIND_MAP,
+  RR_BPF_TOKEN_CREATE,
+};
+
+#ifndef FSCONFIG_CMD_CREATE
+#define FSCONFIG_CMD_CREATE 6
+#endif
+#ifndef MOVE_MOUNT_F_EMPTY_PATH
+#define MOVE_MOUNT_F_EMPTY_PATH 0x00000004
 #endif
 
 #endif /* RRUTIL_H */

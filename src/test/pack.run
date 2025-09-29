@@ -1,0 +1,47 @@
+source `dirname $0`/util.sh
+
+switch_to_nontmp_workdir_if_possible
+dd bs=1 count=65539 if=/dev/urandom of=mapped_file >& /dev/null
+dd bs=1 count=65539 if=/dev/urandom of=mapped_file2 >& /dev/null
+dd bs=1 count=1800 if=/dev/urandom of=mapped_file3 >& /dev/null
+dd bs=1 count=1800 if=/dev/urandom of=mapped_file4 >& /dev/null
+/bin/chmod u+x mapped_file*
+record pack$bitness
+
+pack || failed "'rr pack' failed"
+if [[ `ls latest-trace/*_pack$bitness-* | wc -l` != "1" ]]; then
+    failed "Failed to coalesce all instances of 'pack'"
+fi
+
+touch does_fs_support_clone
+# Assumes your `cp` supports the --reflink flag
+cp --reflink=always does_fs_support_clone does_fs_support_clone1
+if [[ $? -ne 0 ]]; then
+  # Since fs does NOT support file cloning, this further check should now be done
+  # (without the outer `if` the pack test would fail on btrfs)
+  if [[ `ls latest-trace/mmap_pack_* | wc -l` == "0" ]]; then
+       failed "Packing produced no files."
+  fi
+fi
+
+# If there are no copies of _mapped_file it was probably copied
+# into the trace data, for one of various reasons, so don't fail
+# the test in that case.
+if [[ `ls latest-trace/*_mapped_file | wc -l` != "0" ]]; then
+    if [[ `ls latest-trace/*_mapped_file | wc -l` != "1" ]]; then
+        failed "Failed to pack 'mapped_file'"
+    fi
+    if [[ `ls latest-trace/*_mapped_file2 | wc -l` != "1" ]]; then
+        failed "Failed to pack 'mapped_file2'"
+    fi
+    if [[ `ls latest-trace/*_mapped_file3 | wc -l` != "1" ]]; then
+        failed "Failed to pack 'mapped_file3'"
+    fi
+    if [[ `ls latest-trace/*_mapped_file4 | wc -l` != "1" ]]; then
+        failed "Failed to pack 'mapped_file4'"
+    fi
+fi
+
+replay
+check EXIT-SUCCESS
+

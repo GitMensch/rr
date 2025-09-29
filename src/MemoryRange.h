@@ -4,6 +4,7 @@
 #define RR_MEMORY_RANGE_H_
 
 #include "core.h"
+#include "log.h"
 #include "remote_ptr.h"
 
 namespace rr {
@@ -41,6 +42,12 @@ public:
   }
   bool contains(remote_ptr<void> p) const { return start_ <= p && p < end_; }
 
+  template <typename T> bool contains(remote_ptr<T> ptr, size_t count = 1) const {
+    auto o_start_ = ptr.template cast<void>();
+    auto o_end_ = (ptr + count).template cast<void>();
+    return start_ <= o_start_ && o_end_ <= end_;
+  }
+
   bool intersects(const MemoryRange& other) const {
     remote_ptr<void> s = std::max(start_, other.start_);
     remote_ptr<void> e = std::min(end_, other.end_);
@@ -56,6 +63,10 @@ public:
   remote_ptr<void> start() const { return start_; }
   remote_ptr<void> end() const { return end_; }
   size_t size() const { return end_ - start_; }
+
+  static MemoryRange all() {
+    return MemoryRange(remote_ptr<void>(), remote_ptr<void>(UINTPTR_MAX));
+  }
 
   // XXX DO NOT USE
   void update_start(remote_ptr<void> s) const {

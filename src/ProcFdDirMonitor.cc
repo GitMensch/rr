@@ -17,18 +17,11 @@ namespace rr {
 ProcFdDirMonitor::ProcFdDirMonitor(Task* t, const string& pathname) {
   // XXX this makes some assumptions about namespaces... Probably fails
   // if |t| is not the same pid namespace as rr
-  int ends_with_slash = (pathname.back() == '/');
-  if (pathname.substr(0, 6) == string("/proc/") &&
-      pathname.substr(pathname.size() - 3 - ends_with_slash, 3) ==
-          string("/fd")) {
-    string s = pathname.substr(6, pathname.size() - 9 - ends_with_slash);
-    char* end;
-    int tid = strtol(s.c_str(), &end, 10);
-    if (!*end) {
-      Task* target = t->session().find_task(tid);
-      if (target) {
-        tuid = target->tuid();
-      }
+  int tid = parse_tid_from_proc_path(pathname, "/fd");
+  if (tid > 0) {
+    Task* target = t->session().find_task(tid);
+    if (target) {
+      tuid = target->tuid();
     }
   }
 }
@@ -100,7 +93,7 @@ template <typename Arch> static void filter_dirents_arch(RecordTask* t) {
     // We filtered out all the entries, so we need to repeat the syscall.
     {
       AutoRemoteSyscalls remote(t);
-      remote.syscall(regs.original_syscallno(), regs.arg1(), regs.arg2(),
+      remote.syscall(regs.original_syscallno(), regs.orig_arg1(), regs.arg2(),
                      regs.arg3());
       // Only copy over the syscall result. In particular, we don't want to
       // copy the AutoRemoteSyscalls ip().

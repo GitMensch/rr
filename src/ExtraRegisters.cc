@@ -4,6 +4,8 @@
 
 #include <string.h>
 
+#include "GdbServerRegister.h"
+#include "ReplayTask.h"
 #include "core.h"
 #include "log.h"
 #include "util.h"
@@ -24,8 +26,6 @@ static const int st_reg_space = 16;
 static const int xmm_regs_offset = 160;
 static const int xmm_reg_space = 16;
 
-static const int xsave_feature_pkru = 9;
-
 static const uint8_t fxsave_387_ctrl_offsets[] = {
   // The Intel documentation says that the following layout is only valid in
   // 32-bit mode, or when fxsave is executed in 64-bit mode without an
@@ -43,6 +43,7 @@ static const uint8_t fxsave_387_ctrl_offsets[] = {
 };
 
 static const int fip_offset = 8;
+static const int fop_offset = 6;
 static const int fdp_offset = 16;
 static const int mxcsr_offset = 24;
 
@@ -55,7 +56,7 @@ struct RegData {
       : offset(offset), size(size), xsave_feature_bit(-1) {}
 };
 
-static bool reg_in_range(GdbRegister regno, GdbRegister low, GdbRegister high,
+static bool reg_in_range(GdbServerRegister regno, GdbServerRegister low, GdbServerRegister high,
                          int offset_base, int offset_stride, int size,
                          RegData* out) {
   if (regno < low || regno > high) {
@@ -66,18 +67,95 @@ static bool reg_in_range(GdbRegister regno, GdbRegister low, GdbRegister high,
   return true;
 }
 
-static const int AVX_FEATURE_BIT = 2;
+static constexpr int AVX_FEATURE_BIT = 2;
+static constexpr int AVX_OPMASK_FEATURE_BIT = 5;
+static constexpr int AVX_ZMM_HI256_FEATURE_BIT = 6;
+static constexpr int AVX_ZMM_HI16_FEATURE_BIT = 7;
+static constexpr int PKRU_FEATURE_BIT = 9;
+
+static const uint64_t PKRU_FEATURE_MASK = 1 << PKRU_FEATURE_BIT;
 
 static const size_t xsave_header_offset = 512;
 static const size_t xsave_header_size = 64;
 static const size_t xsave_header_end = xsave_header_offset + xsave_header_size;
-// This is always at 576 since AVX is always the first optional feature,
-// if present.
-static const size_t AVX_xsave_offset = 576;
+struct RegisterDescriptor {
+  // Feature bits given by CPUID
+  int8_t feature;
+  // Width in bytes in the xsave area
+  int8_t size;
+  // If the registers described by this descriptor is laid out in Hi16 ranges,
+  // value can be non-zero.
+  int8_t hi16_offset;
+  // Range of registers described by descriptor
+  GdbServerRegister base;
+  GdbServerRegister end_inclusive;
+  // The stride of the register (how far between the start of this register to
+  // the next register of the same type, in the xsave area)
+  int stride;
+
+  int register_offset(GdbServerRegister reg) const noexcept {
+    DEBUG_ASSERT(reg >= base && reg < (base + 16));
+    const auto& layout = xsave_native_layout();
+    return layout.feature_layouts[feature].offset + hi16_offset +
+           (reg - base) * stride;
+  }
+
+  bool describes_register(GdbServerRegister gdb_register) const {
+    // compare end first because we search table linerarly.
+    return gdb_register <= end_inclusive && gdb_register >= base;
+  }
+};
+
+/**
+ * These descriptors describe the layout of the XSAVE area for avx2 and
+ * avx512 extensions. where the actual contents for the registers get read from.
+ * `RegisterDescriptor::feature` is used to index into `XSaveFeatureLayout` to
+ * get the base offset for a particular range.
+ *
+ * Register ranges in the xsave area that differ is the Hi16 ones.
+ * In these ranges, the registers are laid out like [xmmN, ymmN, zmmN],
+ * instead of [xmm0..N], [ymm0..N]. So to get e.g. zmm18 we need 3 offsets;
+ * 1. offset to the sub-region of xsave for [xmmN, ymmN, zmmN] are found (N>15)
+ * 2. offset to where register-range N=18 begins, e.g. [xmm18, ymm18, zmm18]
+ * 3. offset to where zmm begins; which is 32 bytes.
+ */
+static constexpr std::array<RegisterDescriptor, 6> register_config_lookup_table{
+  { { AVX_FEATURE_BIT, 16, 0, DREG_64_YMM0H,
+      GdbServerRegister(DREG_64_YMM15H), 16 },
+    { AVX_ZMM_HI16_FEATURE_BIT, 16, 0, DREG_64_XMM16,
+      GdbServerRegister(DREG_64_XMM31), 64 },
+    { AVX_ZMM_HI16_FEATURE_BIT, 16, 16, DREG_64_YMM16H,
+      GdbServerRegister(DREG_64_YMM31H), 64 },
+    { AVX_ZMM_HI256_FEATURE_BIT, 32, 0, DREG_64_ZMM0H,
+      GdbServerRegister(DREG_64_ZMM15H), 32 },
+    { AVX_ZMM_HI16_FEATURE_BIT, 32, 32, DREG_64_ZMM16H,
+      GdbServerRegister(DREG_64_ZMM31H), 64 },
+    { AVX_OPMASK_FEATURE_BIT, 8, 0, DREG_64_K0,
+      GdbServerRegister(DREG_64_K7), 8 } }
+};
+
+// Every range of registers (except K0-7) are 16 registers long. We use this
+// fact to build a lookup table, for the AVX2 and AVX512 registers.
+static bool reg_is_avx2_or_512(GdbServerRegister reg, RegData& out) noexcept {
+  if (reg < DREG_64_YMM0H || reg > DREG_64_K7) {
+    return false;
+  }
+
+  for (const auto& descriptor : register_config_lookup_table) {
+    if (descriptor.describes_register(reg)) {
+      out.xsave_feature_bit = descriptor.feature;
+      out.size = descriptor.size;
+      out.offset = descriptor.register_offset(reg);
+      return true;
+    }
+  }
+  FATAL() << "Unknown AVX512F register: " << reg;
+  return true;
+}
 
 // Return the size and data location of register |regno|.
 // If we can't read the register, returns -1 in 'offset'.
-static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
+static RegData xsave_register_data(SupportedArch arch, GdbServerRegister regno) {
   // Check regno is in range, and if it's 32-bit then convert it to the
   // equivalent 64-bit register.
   switch (arch) {
@@ -85,20 +163,29 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
       // Convert regno to the equivalent 64-bit version since the XSAVE layout
       // is compatible
       if (regno >= DREG_XMM0 && regno <= DREG_XMM7) {
-        regno = (GdbRegister)(regno - DREG_XMM0 + DREG_64_XMM0);
+        regno = (GdbServerRegister)(regno - DREG_XMM0 + DREG_64_XMM0);
         break;
       }
       if (regno >= DREG_YMM0H && regno <= DREG_YMM7H) {
-        regno = (GdbRegister)(regno - DREG_YMM0H + DREG_64_YMM0H);
+        regno = (GdbServerRegister)(regno - DREG_YMM0H + DREG_64_YMM0H);
         break;
       }
-      if (regno < DREG_FIRST_FXSAVE_REG || regno > DREG_LAST_FXSAVE_REG) {
-        return RegData();
+      if (regno >= DREG_ZMM0H && regno <= DREG_ZMM7H) {
+        regno = (GdbServerRegister)(regno - DREG_ZMM0H + DREG_64_ZMM0H);
+        break;
+      }
+      if (regno >= DREG_K0 && regno <= DREG_K7) {
+        regno = (GdbServerRegister)(regno - DREG_K0 + DREG_64_K0);
+        break;
       }
       if (regno == DREG_MXCSR) {
         regno = DREG_64_MXCSR;
+      } else if (regno == DREG_PKRU) {
+        regno = DREG_64_PKRU;
+      } else if (regno < DREG_FIRST_FXSAVE_REG || regno > DREG_LAST_FXSAVE_REG) {
+        return RegData();
       } else {
-        regno = (GdbRegister)(regno - DREG_FIRST_FXSAVE_REG +
+        regno = (GdbServerRegister)(regno - DREG_FIRST_FXSAVE_REG +
                               DREG_64_FIRST_FXSAVE_REG);
       }
       break;
@@ -119,9 +206,22 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
     return result;
   }
 
-  if (reg_in_range(regno, DREG_64_YMM0H, DREG_64_YMM15H, AVX_xsave_offset, 16,
-                   16, &result)) {
-    result.xsave_feature_bit = AVX_FEATURE_BIT;
+  if (reg_is_avx2_or_512(regno, result)) {
+    return result;
+  }
+
+  if (regno == DREG_64_PKRU) {
+    const XSaveLayout& layout = xsave_native_layout();
+    if (PKRU_FEATURE_BIT > layout.feature_layouts.size()) {
+      return RegData();
+    }
+
+    const XSaveFeatureLayout& fl = layout.feature_layouts[PKRU_FEATURE_BIT];
+    result.offset = fl.offset;
+    // NB: the PKRU *region* may be 8 bytes to maintain alignment but the
+    // PKRU *register* is only the first 4 bytes.
+    result.size = 4;
+    result.xsave_feature_bit = PKRU_FEATURE_BIT;
     return result;
   }
 
@@ -139,16 +239,25 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
   return RegData(fxsave_387_ctrl_offsets[regno - DREG_64_FCTRL], 4);
 }
 
-static uint64_t xsave_features(const vector<uint8_t>& data) {
+static const uint64_t* xsave_features(const vector<uint8_t>& data) {
   // If this is just FXSAVE(64) data then we we have no XSAVE header and no
   // XSAVE(64) features enabled.
   return data.size() < xsave_header_offset + xsave_header_size
-             ? 0
-             : *reinterpret_cast<const uint64_t*>(data.data() +
-                                                  xsave_header_offset);
+             ? nullptr
+             : reinterpret_cast<const uint64_t*>(data.data() +
+                                                 xsave_header_offset);
+
 }
 
-size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
+static uint64_t* xsave_features(vector<uint8_t>& data) {
+  // If this is just FXSAVE(64) data then we we have no XSAVE header and no
+  // XSAVE(64) features enabled.
+  return data.size() < xsave_header_offset + xsave_header_size
+             ? nullptr
+             : reinterpret_cast<uint64_t*>(data.data() + xsave_header_offset);
+}
+
+size_t ExtraRegisters::read_register(uint8_t* buf, GdbServerRegister regno,
                                      bool* defined) const {
   if (format_ == NT_FPR) {
     if (arch() != aarch64) {
@@ -194,14 +303,78 @@ size_t ExtraRegisters::read_register(uint8_t* buf, GdbRegister regno,
 
   // Apparently before any AVX registers are used, the feature bit is not set
   // in the XSAVE data, so we'll just return 0 for them here.
+  const uint64_t* xsave_features_ = xsave_features(data_);
   if (reg_data.xsave_feature_bit >= 0 &&
-      !(xsave_features(data_) & (1 << reg_data.xsave_feature_bit))) {
+      (!xsave_features_ ||
+       !(*xsave_features_ & (1 << reg_data.xsave_feature_bit)))) {
     memset(buf, 0, reg_data.size);
   } else {
     DEBUG_ASSERT(size_t(reg_data.offset + reg_data.size) <= data_.size());
     memcpy(buf, data_.data() + reg_data.offset, reg_data.size);
   }
   return reg_data.size;
+}
+
+bool ExtraRegisters::write_register(GdbServerRegister regno, const void* value,
+                                    size_t value_size) {
+  if (format_ == NT_FPR) {
+    if (arch() != aarch64) {
+      return false;
+    }
+
+    RegData reg_data;
+    if (DREG_V0 <= regno && regno <= DREG_V31) {
+      reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, vregs[0]) +
+        ((regno - DREG_V0) * 16), 16);
+    } else if (regno == DREG_FPSR) {
+      reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, fpsr),
+                         sizeof(uint32_t));
+    } else if (regno == DREG_FPCR) {
+      reg_data = RegData(offsetof(ARM64Arch::user_fpsimd_state, fpcr),
+                         sizeof(uint32_t));
+    } else {
+      return false;
+    }
+
+    DEBUG_ASSERT(reg_data.size > 0);
+    if ((size_t)reg_data.size != value_size) {
+      LOG(warn) << "Register " << regno << "has mismatched sizes ("
+                << reg_data.size << " vs " << value_size << ")";
+      return false;
+    }
+
+    DEBUG_ASSERT(size_t(reg_data.offset + reg_data.size) <= data_.size());
+    memcpy(data_.data() + reg_data.offset, value, value_size);
+    return true;
+  }
+
+  if (format_ != XSAVE) {
+    return false;
+  }
+
+  auto reg_data = xsave_register_data(arch(), regno);
+  if (reg_data.offset < 0 || empty()) {
+    return false;
+  }
+
+  DEBUG_ASSERT(reg_data.size > 0);
+  if ((size_t)reg_data.size != value_size) {
+    LOG(warn) << "Register " << regno << "has mismatched sizes ("
+              << reg_data.size << " vs " << value_size << ")";
+    return false;
+  }
+
+  if (reg_data.xsave_feature_bit >= 0) {
+    uint64_t* xsave_features_ = xsave_features(data_);
+    if (!xsave_features_) {
+      return false;
+    }
+
+    *xsave_features_ |= (1 << reg_data.xsave_feature_bit);
+  }
+
+  memcpy(data_.data() + reg_data.offset, value, value_size);
+  return true;
 }
 
 static const int xinuse_offset = 512;
@@ -225,6 +398,17 @@ uint64_t ExtraRegisters::read_fip(bool* defined) const {
 
   uint64_t ret;
   memcpy(&ret, data_.data() + fip_offset, sizeof(ret));
+  return ret;
+}
+
+uint16_t ExtraRegisters::read_fop(bool* defined) const {
+  if (format_ != XSAVE) {
+    *defined = false;
+    return 0;
+  }
+
+  uint16_t ret;
+  memcpy(&ret, data_.data() + fop_offset, sizeof(ret));
   return ret;
 }
 
@@ -269,29 +453,34 @@ void ExtraRegisters::validate(Task* t) {
   if (data_.size() > offset) {
     ASSERT(t, data_.size() >= offset + 64);
     offset += 64;
-    uint64_t features = xsave_features(data_);
-    if (features & (1 << AVX_FEATURE_BIT)) {
+    const uint64_t* features = xsave_features(data_);
+    if (features && (*features & (1 << AVX_FEATURE_BIT))) {
       ASSERT(t, data_.size() >= offset + 256);
     }
   }
 }
 
-static void print_reg(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
-                      const char* name, FILE* f) {
-  uint8_t buf[128];
+static size_t get_full_value(const ExtraRegisters& r, GdbServerRegister low, GdbServerRegister hi,
+                             uint8_t buf[128]) {
   bool defined = false;
   size_t len = r.read_register(buf, low, &defined);
   DEBUG_ASSERT(defined && len <= 64);
-  if (hi != GdbRegister(0)) {
+  if (hi != GdbServerRegister(0)) {
     size_t len2 = r.read_register(buf + len, hi, &defined);
     if (defined) {
       DEBUG_ASSERT(len == len2);
       len += len2;
     }
   }
-  char out[257];
+  return len;
+}
+
+static string reg_to_string(const ExtraRegisters& r, GdbServerRegister low, GdbServerRegister hi) {
+  uint8_t buf[128];
+  size_t len = get_full_value(r, low, hi, buf);
   bool printed_digit = false;
-  char* p = out;
+  char out_buf[257];
+  char* p = out_buf;
   for (int i = len - 1; i >= 0; --i) {
     if (!printed_digit && !buf[i] && i > 0) {
       continue;
@@ -299,16 +488,22 @@ static void print_reg(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
     p += sprintf(p, printed_digit ? "%02x" : "%x", buf[i]);
     printed_digit = true;
   }
-  fprintf(f, "%s:0x%s", name, out);
+  return out_buf;
 }
 
-static void print_regs(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
+static void print_reg(const ExtraRegisters& r, GdbServerRegister low, GdbServerRegister hi,
+                      const char* name, FILE* f) {
+  string out = reg_to_string(r, low, hi);
+  fprintf(f, "%s:0x%s", name, out.c_str());
+}
+
+static void print_regs(const ExtraRegisters& r, GdbServerRegister low, GdbServerRegister hi,
                        int num_regs, const char* name_base, FILE* f) {
   for (int i = 0; i < num_regs; ++i) {
     char buf[80];
     sprintf(buf, "%s%d", name_base, i);
-    print_reg(r, (GdbRegister)(low + i),
-              hi == GdbRegister(0) ? hi : (GdbRegister)(hi + i), buf, f);
+    print_reg(r, (GdbServerRegister)(low + i),
+              hi == GdbServerRegister(0) ? hi : (GdbServerRegister)(hi + i), buf, f);
     if (i < num_regs - 1) {
       fputc(' ', f);
     }
@@ -318,22 +513,22 @@ static void print_regs(const ExtraRegisters& r, GdbRegister low, GdbRegister hi,
 void ExtraRegisters::print_register_file_compact(FILE* f) const {
   switch (arch_) {
     case x86:
-      print_regs(*this, DREG_ST0, GdbRegister(0), 8, "st", f);
+      print_regs(*this, DREG_ST0, GdbServerRegister(0), 8, "st", f);
       fputc(' ', f);
       print_regs(*this, DREG_XMM0, DREG_YMM0H, 8, "ymm", f);
       break;
     case x86_64:
-      print_regs(*this, DREG_64_ST0, GdbRegister(0), 8, "st", f);
+      print_regs(*this, DREG_64_ST0, GdbServerRegister(0), 8, "st", f);
       fputc(' ', f);
       print_regs(*this, DREG_64_XMM0, DREG_64_YMM0H, 16, "ymm", f);
       break;
     case aarch64:
       DEBUG_ASSERT(format_ == NT_FPR);
-      print_regs(*this, DREG_V0, GdbRegister(0), 32, "v", f);
+      print_regs(*this, DREG_V0, GdbServerRegister(0), 32, "v", f);
       fputc(' ', f);
-      print_reg(*this, DREG_FPSR, GdbRegister(0), "fpsr", f);
+      print_reg(*this, DREG_FPSR, GdbServerRegister(0), "fpsr", f);
       fputc(' ', f);
-      print_reg(*this, DREG_FPCR, GdbRegister(0), "fpcr", f);
+      print_reg(*this, DREG_FPCR, GdbServerRegister(0), "fpcr", f);
       break;
     default:
       DEBUG_ASSERT(0 && "Unknown arch");
@@ -387,29 +582,9 @@ template <typename T> static vector<uint8_t> to_vector(const T& v) {
   return result;
 }
 
-static bool all_zeroes(const uint8_t* data, size_t size) {
-  for (size_t i = 0; i < size; ++i) {
-    if (data[i]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-static uint32_t features_used(const uint8_t* data,
-                              const XSaveLayout& layout) {
+static uint32_t features_used(const uint8_t* data) {
   uint64_t features;
   memcpy(&features, data + xsave_header_offset, sizeof(features));
-  uint64_t pkru_bit = uint64_t(1) << xsave_feature_pkru;
-  if ((features & pkru_bit) &&
-      xsave_feature_pkru < layout.feature_layouts.size()) {
-    // Check if it's really used
-    const XSaveFeatureLayout& fl = layout.feature_layouts[xsave_feature_pkru];
-    if (uint64_t(fl.offset) + fl.size <= layout.full_size &&
-        all_zeroes(data + fl.offset, fl.size)) {
-      features &= ~pkru_bit;
-    }
-  }
   return features;
 }
 
@@ -474,7 +649,28 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
 
   // Check for unsupported features being used
   if (layout.full_size >= xsave_header_end) {
-    uint64_t features = features_used(data, layout);
+    uint64_t features = features_used(data);
+    /* Mask off the PKRU bit unconditionally here.
+     * We want traces that are recorded on machines with PKRU but
+     * that don't actually use PKRU to be replayable on machines
+     * without PKRU. Linux, however, sets the PKRU register to
+     * 0x55555554 (only the default key is allowed to access memory),
+     * while the default hardware value is 0, so in some sense
+     * PKRU is always in use.
+     *
+     * There are three classes of side effects of the pkey feature.
+     * 1. The direct effects of syscalls such as pkey_alloc/pkey_mprotect
+     *    on registers.
+     * 2. Traps generated by the CPU when the protection keys are violated.
+     * 3. The RDPKRU instruction writing to EAX.
+     *
+     * The first two are replayed exactly by rr. The latter will trigger
+     * SIGILL on any machine without PKRU, which is no different from
+     * any other new CPU instruction that doesn't have its own XSAVE
+     * feature bit. So ignore the PKRU bit here and leave users on their
+     * own with respect to RDPKRU.
+     */
+    features &= ~PKRU_FEATURE_MASK;
     if (features & ~native_layout.supported_feature_bits) {
       LOG(error) << "Unsupported CPU features found: got " << HEX(features)
                  << " (" << xsave_feature_string(features)
@@ -501,15 +697,10 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
     return true;
   }
 
-  uint64_t features = features_used(data, layout);
+  uint64_t features = features_used(data);
   // OK, now both our native layout and the input layout are using the full
-  // XSAVE header. Copy the header. Make sure to use our updated `features`.
-  memcpy(data_.data() + xsave_header_offset, &features, sizeof(features));
-  memcpy(data_.data() + xsave_header_offset + sizeof(features),
-         data + xsave_header_offset + sizeof(features),
-         xsave_header_size - sizeof(features));
-
-  // Now copy each optional and present area into the right place in our struct
+  // XSAVE header. Copy each optional and present area into the right place
+  // in our struct.
   for (size_t i = 2; i < 64; ++i) {
     if (features & (uint64_t(1) << i)) {
       if (i >= layout.feature_layouts.size()) {
@@ -523,8 +714,27 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
                    << feature.size << " > " << layout.full_size;
         return false;
       }
+      if (i >= native_layout.feature_layouts.size()) {
+        if (i == PKRU_FEATURE_BIT) {
+          // The native arch doesn't support PKRU.
+          // This must be during replay, and as the comments above explain,
+          // it's OK to not set PKRU during replay on a pre-PKRU CPU, so
+          // we can just ignore this.
+          features &= ~PKRU_FEATURE_MASK;
+          continue;
+        } else {
+          LOG(error) << "Invalid feature " << i << " beyond max layout "
+                     << layout.feature_layouts.size();
+          return false;
+        }
+      }
       const XSaveFeatureLayout& native_feature =
           native_layout.feature_layouts[i];
+      if (native_feature.size == 0 && i == PKRU_FEATURE_BIT) {
+        // See the above comment about PKRU.
+        features &= ~PKRU_FEATURE_MASK;
+        continue;
+      }
       if (feature.size != native_feature.size) {
         LOG(error) << "Feature " << i << " has wrong size " << feature.size
                    << ", expected " << native_feature.size;
@@ -539,12 +749,17 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
     }
   }
 
+  // Copy the header. Make sure to use our updated `features`.
+  memcpy(data_.data() + xsave_header_offset, &features, sizeof(features));
+  memcpy(data_.data() + xsave_header_offset + sizeof(features),
+         data + xsave_header_offset + sizeof(features),
+         xsave_header_size - sizeof(features));
+
   return true;
 }
 
 vector<uint8_t> ExtraRegisters::get_user_fpregs_struct(
     SupportedArch arch) const {
-  DEBUG_ASSERT(format_ == XSAVE);
   switch (arch) {
     case x86:
       DEBUG_ASSERT(format_ == XSAVE);
@@ -570,9 +785,9 @@ vector<uint8_t> ExtraRegisters::get_user_fpregs_struct(
 
 void ExtraRegisters::set_user_fpregs_struct(Task* t, SupportedArch arch,
                                             void* data, size_t size) {
-  DEBUG_ASSERT(format_ == XSAVE);
   switch (arch) {
     case x86:
+      DEBUG_ASSERT(format_ == XSAVE);
       ASSERT(t, size >= sizeof(X86Arch::user_fpregs_struct));
       ASSERT(t, data_.size() >= sizeof(X86Arch::user_fpxregs_struct));
       convert_x86_fpregs_to_fxsave(
@@ -580,9 +795,16 @@ void ExtraRegisters::set_user_fpregs_struct(Task* t, SupportedArch arch,
           reinterpret_cast<X86Arch::user_fpxregs_struct*>(data_.data()));
       return;
     case x86_64:
+      DEBUG_ASSERT(format_ == XSAVE);
       ASSERT(t, data_.size() >= sizeof(X64Arch::user_fpregs_struct));
       ASSERT(t, size >= sizeof(X64Arch::user_fpregs_struct));
       memcpy(data_.data(), data, sizeof(X64Arch::user_fpregs_struct));
+      return;
+    case aarch64:
+      DEBUG_ASSERT(format_ == NT_FPR);
+      ASSERT(t, size >= sizeof(ARM64Arch::user_fpregs_struct));
+      ASSERT(t, data_.size() >= sizeof(ARM64Arch::user_fpregs_struct));
+      memcpy(data_.data(), data, sizeof(ARM64Arch::user_fpregs_struct));
       return;
     default:
       DEBUG_ASSERT(0 && "Unknown arch");
@@ -604,7 +826,7 @@ void ExtraRegisters::set_user_fpxregs_struct(
   memcpy(data_.data(), &regs, sizeof(regs));
 }
 
-static void set_word(SupportedArch arch, vector<uint8_t>& v, GdbRegister r,
+static void set_word(SupportedArch arch, vector<uint8_t>& v, GdbServerRegister r,
                      int word) {
   RegData d = xsave_register_data(arch, r);
   DEBUG_ASSERT(d.size == 4);
@@ -638,13 +860,16 @@ void ExtraRegisters::reset() {
       * set in order to get the kernel to properly update the PKRU register
       * value. If this is not set, it has been observed that the PKRU register
       * may occasionally contain "stale" values, particularly after involuntary
-      * context swtiches.
+      * context switches.
       * Avoid this issue by setting the bit if the feature is supported by the
       * CPU.
       */
-      uint64_t pkru_bit = uint64_t(1) << xsave_feature_pkru;
-      if (xcr0() & pkru_bit) {
-        xinuse |= pkru_bit;
+      if (xcr0() & PKRU_FEATURE_MASK) {
+        RegData d = xsave_register_data(arch(), arch() == x86_64 ? DREG_64_PKRU : DREG_PKRU);
+        DEBUG_ASSERT(d.xsave_feature_bit == PKRU_FEATURE_BIT);
+        DEBUG_ASSERT(d.offset + d.size <= (int)data_.size());
+        *reinterpret_cast<int*>(data_.data() + d.offset) = 0x55555554;
+        xinuse |= PKRU_FEATURE_MASK;
       }
 
       memcpy(data_.data() + xinuse_offset, &xinuse, sizeof(xinuse));
@@ -653,6 +878,67 @@ void ExtraRegisters::reset() {
     DEBUG_ASSERT(format_ == NT_FPR);
     DEBUG_ASSERT(arch() == aarch64 &&
       "Ensure that nothing is required here for your architecture.");
+  }
+}
+
+static void compare_regs(const ExtraRegisters& reg1,
+                         const ExtraRegisters& reg2,
+                         GdbServerRegister low, GdbServerRegister hi,
+                         int num_regs, const char* name_base,
+                         Registers::Comparison& result) {
+  for (int i = 0; i < num_regs; ++i) {
+    GdbServerRegister this_low = (GdbServerRegister)(low + i);
+    GdbServerRegister this_hi = hi == GdbServerRegister(0) ? hi : (GdbServerRegister)(hi + i);
+    uint8_t buf1[128];
+    size_t len1 = get_full_value(reg1, this_low, this_hi, buf1);
+    uint8_t buf2[128];
+    size_t len2 = get_full_value(reg2, this_low, this_hi, buf2);
+    DEBUG_ASSERT(len1 == len2);
+
+    if (!memcmp(buf1, buf2, len1)) {
+      continue;
+    }
+
+    ++result.mismatch_count;
+    if (result.store_mismatches) {
+      char regname[80];
+      sprintf(regname, "%s%d", name_base, i);
+      result.mismatches.push_back({regname, reg_to_string(reg1, this_low, this_hi),
+          reg_to_string(reg2, this_low, this_hi)});
+    }
+  }
+}
+
+void ExtraRegisters::compare_internal(const ExtraRegisters& reg2,
+  Registers::Comparison& result) const {
+  if (arch() != reg2.arch()) {
+    FATAL() << "Can't compare register files with different archs";
+  }
+
+  if (format() == NONE || reg2.format() == NONE) {
+    // Not enough data to check anything
+    return;
+  }
+  if (format() != reg2.format()) {
+    FATAL() << "Can't compare register files with different formats";
+  }
+
+  switch (arch()) {
+    case x86:
+      compare_regs(*this, reg2, DREG_ST0, GdbServerRegister(0), 8, "st", result);
+      compare_regs(*this, reg2, DREG_XMM0, DREG_YMM0H, 8, "ymm", result);
+      break;
+    case x86_64:
+      compare_regs(*this, reg2, DREG_64_ST0, GdbServerRegister(0), 8, "st", result);
+      compare_regs(*this, reg2, DREG_64_XMM0, DREG_64_YMM0H, 8, "ymm", result);
+      break;
+    case aarch64:
+      DEBUG_ASSERT(format_ == NT_FPR);
+      compare_regs(*this, reg2, DREG_V0, GdbServerRegister(0), 32, "v", result);
+      break;
+    default:
+      DEBUG_ASSERT(0 && "Unknown arch");
+      break;
   }
 }
 

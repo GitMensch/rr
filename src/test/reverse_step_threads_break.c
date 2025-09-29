@@ -13,9 +13,11 @@ static size_t my_read(int fd, void* buf, size_t size) {
   size_t ret;
 #ifdef __x86_64__
   __asm__("syscall\n\t"
+          /* Make sure we don't patch this syscall for syscall buffering */
+          "cmp $77,%%rax\n\t"
           : "=a"(ret)
           : "a"(SYS_read), "D"(fd), "S"(buf), "d"(size)
-          : "memory");
+          : "memory", "flags");
 #elif defined(__i386__)
   __asm__("xchg %%ebx,%%edi\n\t"
           "int $0x80\n\t"
@@ -28,7 +30,10 @@ static size_t my_read(int fd, void* buf, size_t size) {
   register void *x1 __asm__ ("x1") = buf;
   register uint64_t x2 __asm__ ("x2") = size;
   register uint64_t x8 __asm__ ("x8") = SYS_read;
-  __asm__("svc #0\n\t"
+  __asm__("b 1f\n\t"
+          "mov x8, 0xdc\n"
+          "1:\n\t"
+          "svc #0\n\t"
           : "+r"(x0)
           : "r"(x1), "r"(x2), "r"(x8)
           : "memory");

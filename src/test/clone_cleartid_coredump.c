@@ -50,16 +50,31 @@ int main(void) {
                 CLONE_VM | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID,
                 NULL, shared_page, NULL, shared_page);
     test_assert(tid > 0);
+
     test_assert(tid = waitpid(tid, &status, __WALL));
-    /* The child will take us down before we have the chance to get here */
-    test_assert(0);
+    test_assert(WIFSIGNALED(status));
+    return 0;
   }
 
   test_assert(child_tid > 0);
   test_assert(child_tid == waitpid(child_tid, &status, __WALL));
-  test_assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
-  test_assert(*(pid_t*)shared_page != (pid_t)-1 &&
-              *(pid_t*)shared_page != 0);
+  if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV) {
+    atomic_puts("Old (<5.16) kernel behavior");
+    // In this case the value of *shared_page is nondeterministic.
+    // If the child_SIGKILL task exits first, it's sharding address space
+    // with the fork() child so the kernel will clear *shared_page.
+    // But the fork() child can exit first, in which case when the
+    // child_SIGKILL task exits, it's not sharing its address space with
+    // any other task, and the kernel doesn't clear *shared_page.
+    // This is observable if you run this test under `strace -f` on
+    // a < 5.16 kernel; for me, it causes the test to fail if we check
+    // *shared_page == 0 here.
+  } else if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    atomic_puts("New (5.16+) kernel behavior");
+    test_assert(*(pid_t*)shared_page == 0);
+  } else {
+    test_assert(0);
+  }
 
   atomic_puts("EXIT-SUCCESS");
   return 0;

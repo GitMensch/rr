@@ -21,9 +21,6 @@ static const uint8_t code[] = {
 #elif defined(__aarch64__)
 static const uint8_t code[] = {
     0x1, 0x0, 0x0, 0xd4,    // svc #0
-    0x1f, 0x20, 0x03, 0xd5, // nop
-    0x1f, 0x20, 0x03, 0xd5, // nop
-    0x1f, 0x20, 0x03, 0xd5, // nop
     0xc0, 0x03, 0x5f, 0xd6, // ret
 };
 #else
@@ -37,7 +34,7 @@ static long do_call(uint8_t* p) {
 #elif defined(__aarch64__)
   register long x8 __asm__("x8") = SYS_getpid;
   register long x0 __asm__("x0") = 0;
-  __asm__ __volatile__("blr %2" : "=r"(x0) : "r"(x8), "r"(p));
+  __asm__ __volatile__("blr %2" : "=r"(x0) : "r"(x8), "r"(p) : "x30"); // x30 = lr
   ret = x0;
 #else
   #error unsupported arch
@@ -45,7 +42,19 @@ static long do_call(uint8_t* p) {
   return ret;
 }
 
-static void check_patch(uint8_t* p) { test_assert(p[0] == 0xe9); }
+static void check_patch(uint8_t* p)
+{
+#if defined (__i386__) || defined(__x86_64__)
+  test_assert(p[0] == 0xe9);
+#elif defined(__aarch64__)
+  uint32_t inst;
+  memcpy(&inst, p, sizeof(inst));
+  // b to immediate instruction
+  test_assert((inst & 0xfc000000) == 0x14000000);
+#else
+  #error unsupported arch
+#endif
+}
 
 int main(void) {
   size_t page_size = sysconf(_SC_PAGESIZE);

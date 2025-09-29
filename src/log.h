@@ -4,16 +4,25 @@
 #define RR_LOG_H
 
 #include <features.h>
+#include <signal.h>
 
 #include <iostream>
 #include <type_traits>
 #include <vector>
+#include <cstdint>
+
+/**
+ * Print siginfo on ostream.
+ */
+std::ostream& operator<<(std::ostream& stream, const siginfo_t& siginfo);
 
 namespace rr {
 
 class Task;
 
 enum LogLevel { LOG_fatal, LOG_error, LOG_warn, LOG_info, LOG_debug };
+
+struct LogModule;
 
 /* A log module is just a string where any uppercase ASCII characters have
  * been lowercased. We assign a LogLevel for each log module; this assignment
@@ -27,6 +36,11 @@ enum LogLevel { LOG_fatal, LOG_error, LOG_warn, LOG_info, LOG_debug };
  *
  * This logging infrastructure is not thread safe. Use only on the main thread.
  */
+
+/**
+ * Get the LogModule from a __FILE__. Useful for caching the module.
+ */
+LogModule& get_log_module(const char* file);
 
 /**
  * Return the ostream to which log data will be written.
@@ -62,12 +76,31 @@ bool is_logging_enabled(LogLevel level, const char* file);
  */
 void flush_log_buffer();
 
+/**
+ * Parse the (RR_UNDER_)RR_LOG environment variable and logging
+ * levels appropriately.
+ */
+void apply_log_spec_from_env();
+
+/**
+ * Set log level according to the specification in spec, according to the format
+ * used by (RR_UNDER_)RR_LOG and `rr --log`.
+ */
+void apply_log_spec(const char *spec);
+
 struct NewlineTerminatingOstream {
   /**
    * `file` must be a pointer that is valid forever, preferably
    * some value of `__FILE__`.
    */
   NewlineTerminatingOstream(LogLevel level, const char* file, int line,
+                            const char* function);
+  /**
+   * `file` must be a pointer that is valid forever, preferably
+   * some value of `__FILE__`.
+   * Use this variant to cached the LogModule for efficiency.
+   */
+  NewlineTerminatingOstream(LogModule** m, LogLevel level, const char* file, int line,
                             const char* function);
   ~NewlineTerminatingOstream();
 
@@ -147,6 +180,14 @@ const EmergencyDebugOstream& operator<<(const EmergencyDebugOstream& stream,
 
 #define IS_LOGGING(_level) is_logging_enabled(LOG_##_level, __FILE__)
 
+#define FILE_CACHE_LOG_MODULE() static LogModule* cached_log_module
+
+/**
+ * Like LOG but with a cached module
+ */
+#define LOGM(_level)                                                            \
+  NewlineTerminatingOstream(&cached_log_module, LOG_##_level, __FILE__, __LINE__, __FUNCTION__)
+
 /** A fatal error has occurred.  Log the error and exit. */
 #define FATAL() FatalOstream(__FILE__, __LINE__, __FUNCTION__)
 
@@ -154,6 +195,9 @@ const EmergencyDebugOstream& operator<<(const EmergencyDebugOstream& stream,
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0
+#endif
+#ifndef __GNUC_PREREQ
+#define __GNUC_PREREQ(maj, min) 0
 #endif
 #if __has_builtin(__builtin_expect) || __GNUC_PREREQ(4, 0)
 #define RR_UNLIKELY(EXPR) __builtin_expect((bool)(EXPR), false)
@@ -175,6 +219,25 @@ const EmergencyDebugOstream& operator<<(const EmergencyDebugOstream& stream,
                             __FUNCTION__, #_cond) _actions;                    \
     }                                                                          \
   } while (0)
+
+/* use of assert() causes "unused variable" warnings in non-DEBUG builds
+ * when a variable is only used in an assertion. DEBUG_ASSERT fixes that
+ * problem. Use DEBUG_ASSERT instead of assert().
+ * This also gives us a stack trace if the assertion fails.
+ */
+#ifdef DEBUG
+#define DEBUG_ASSERT(cond) \
+  do {                     \
+    if (!(cond)) {         \
+      FATAL() << #cond;    \
+    }                      \
+  } while(0)
+#else
+#define DEBUG_ASSERT(cond)                                                     \
+  do {                                                                         \
+    size_t s __attribute__((unused)) = sizeof(cond);                           \
+  } while (0)
+#endif
 
 /**
  * Ensure that |_v| is streamed in hex format.

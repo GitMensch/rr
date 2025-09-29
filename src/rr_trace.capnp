@@ -54,6 +54,15 @@ enum ChaosMode {
   knownFalse @2;
 }
 
+struct UtsName {
+  sysname @0 :CString;
+  nodename @1 :CString;
+  release @2 :CString;
+  version @3 :CString;
+  machine @4 :CString;
+  domainname @5 :CString;
+}
+
 # The 'version' file contains an ASCII version number followed by a newline.
 # The version number is currently 85 and increments only when there's a
 # backwards-incompatible change. See TRACE_VERSION.
@@ -99,7 +108,7 @@ struct Header {
     clearFipFdp @14 :Bool = false;
   }
   # These flags guard rr behavior differences that ensure old rr traces can
-  # be sucessfully replayed on newer replayers
+  # be successfully replayed on newer replayers
   quirks :group {
     # Whether the version of rr that recorded this, explicitly recorded
     # modifications made through /proc/<pid>/<mem>
@@ -108,14 +117,47 @@ struct Header {
     # Whether the version of rr that recorded this (may have) had special
     # record behavior for librrpage.so
     specialLibrrpage @15 :Bool = true;
+
+    # Whether the version of rr that recorded this saved the extra registers
+    # for the pkey_alloc syscall.
+    pkeyAllocRecordedExtraRegs @20 :Bool = false;
+
+    # Whether the version of rr that recorded this forced a tick after each
+    # buffered syscall.
+    bufferedSyscallForcedTick @21 :Bool = false;
+
+    # Whether the version of rr that recorded this was using the globals.in_replay
+    # flag rather than the rr page in_replay flag.
+    usesGlobalsInReplay @24 :Bool = true;
   }
   # Are we known to be in chaos mode? Useful for debugging.
   chaosMode @16 :ChaosMode = unknown;
   # If in chaos mode, what was the global exclusion range. Useful for debugging.
   exclusionRangeStart @17 :RemotePtr;
   exclusionRangeEnd @18 :RemotePtr;
-  # Replaying this trace requires at least this forward-compabilitity-version
+  # Replaying this trace requires at least this forward-compatibility-version
   requiredForwardCompatibilityVersion @19 :Int32;
+  # real page size of the recorded process
+  runtimePageSize @22 :UInt32 = 4096;
+  # rr page size, i.e. the one used to build the librr_page.so
+  preloadLibraryPageSize @23 :UInt32 = 4096;
+  # SYSCALLBUF_FDS_DISABLED_SIZE during recording
+  syscallbufFdsDisabledSize @25 :UInt32 = 1024;
+  # sizeof(syscallbuf_hdr) during recording
+  syscallbufHdrSize @26 :UInt32 = 30;
+  # Result of uname(2). Possibly useful for diagnostics or LLDB qHostInfo.
+  uname @27 :UtsName;
+  # The highest virtual address size (in bits) needed to replay this trace. Some
+  # platforms (e.g. x86-64) have multiple possible virtual address sizes, and
+  # trace portability requires that traces that require a higher virtual address
+  # size are not replayed on systems that only support a lower virtual address
+  # size. A value of 0, only present for traces recorded before this was added,
+  # means the default value for the relevant arch.
+  maxVirtualAddressSize @28 :UInt8 = 0;
+  # One of our pre-flight checks found the CPU has issues (e.g. the Zen SpecLockMap
+  # optimization is not disabled) but the user chose to force recording to
+  # continue regardless.
+  cpuImproperlyConfigured @29 :CpuTriState = unknown;
 }
 
 # A file descriptor belonging to a task
@@ -186,6 +228,10 @@ struct TaskEvent {
       # Never null (in traces that support the field)
       # Added after 5.0.0
       exeBase @8 :RemotePtr;
+      interpBase @10 :RemotePtr;
+      # Not a Path since it is only meaningful during recording
+      interpName @11 :CString;
+      pacData @12 :PACData;
     }
     # Most frame 'exit' events generate one of these, but these are not
     # generated if rr ends abnormally so the tasks did not in fact exit during
@@ -211,6 +257,10 @@ struct MemWrite {
   # A list of regions where zeroes are written. These are not
   # present in the compressed data.
   holes @3 :List(WriteHole);
+  # This is set for writes where we don't actually know that the write
+  # will apply in full in the replayee (e.g. for conservative sigframe
+  # captures when handling EV_SIGNAL).
+  sizeIsConservative @4 :Bool;
 }
 
 enum Arch {
@@ -226,6 +276,11 @@ struct Registers {
 
 struct ExtraRegisters {
   # May be empty. Format determined by Frame::arch
+  raw @0 :Data;
+}
+
+struct PACData {
+  # Formay determined by Frame::arch
   raw @0 :Data;
 }
 
@@ -264,6 +319,11 @@ struct OpenedFd {
   inode @3 :Inode;
 }
 
+struct MemRange {
+  start @0 :RemotePtr;
+  end @1 :RemotePtr;
+}
+
 # The 'events' file is a sequence of these.
 struct Frame {
   tid @0 :Tid;
@@ -283,6 +343,10 @@ struct Frame {
   arch @5 :Arch;
   registers @6 :Registers;
   extraRegisters @7 :ExtraRegisters;
+  # If the event ends in the syscallbuf, then the address of the 'syscall_hook'
+  # function, otherwise zero.
+  # For legacy reasons this lives here but it only applies to sched events.
+  inSyscallbufSyscallHook @30 :UInt64;
   event :union {
     instructionTrap @8 :Void;
     patchSyscall @9 :Void;
@@ -318,9 +382,18 @@ struct Frame {
           localAddr @29 :Data;
           remoteAddr @30 :Data;
         }
+        # The list of all memory ranges affected by an madvise(). If empty,
+        # a successful madvise affected the range indicated by its parameters,
+        # and an unsuccessful madvise affected nothing.
+        # Currently, if an madvise was fully successful (returned 0),
+        # this list is always empty.
+        # Only populated for replay-relevant madvises, i.e. DONTNEED(_LOCKED)
+        # and REMOVE.
+        madviseRanges @32 :List(MemRange);
       }
     }
     patchAfterSyscall @27: Void;
     patchVsyscall @28: Void;
+    patchTrappingInstruction @31: Void;
   }
 }

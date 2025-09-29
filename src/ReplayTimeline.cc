@@ -120,11 +120,11 @@ ReplayTimeline::ProtoMark ReplayTimeline::proto_mark() const {
   return ProtoMark(current_mark_key());
 }
 
-shared_ptr<ReplayTimeline::InternalMark> ReplayTimeline::current_mark() {
+shared_ptr<ReplayTimeline::InternalMark> ReplayTimeline::current_mark() const {
   auto it = marks.find(current_mark_key());
   // Avoid creating an entry in 'marks' if it doesn't already exist
   if (it != marks.end()) {
-    for (shared_ptr<InternalMark>& m : it->second) {
+    for (const shared_ptr<InternalMark>& m : it->second) {
       if (m->equal_states(*current)) {
         return m;
       }
@@ -426,7 +426,6 @@ void ReplayTimeline::seek_to_ticks(FrameTime time, Ticks ticks) {
 
   while (current->trace_reader().time() < time) {
     ReplaySession::StepConstraints constraints(RUN_CONTINUE);
-    constraints.stop_at_time = time;
     ReplayResult result = current->replay_step(constraints);
     if (result.status != REPLAY_CONTINUE) {
       FATAL() << "Trace finished before target was reached";
@@ -500,7 +499,6 @@ ReplayResult ReplayTimeline::replay_step_to_mark(
     // we should.
     ReplaySession::StepConstraints constraints =
         strategy.setup_step_constraints();
-    constraints.stop_at_time = mark.ptr->proto.key.trace_time;
     result = current->replay_step(constraints);
     update_strategy_and_fix_watchpoint_quirk(strategy, constraints, result,
                                              before);
@@ -589,7 +587,6 @@ void ReplayTimeline::seek_to_proto_mark(const ProtoMark& pmark) {
   while (!pmark.equal_states(*current)) {
     if (current->trace_reader().time() < pmark.key.trace_time) {
       ReplaySession::StepConstraints constraints(RUN_CONTINUE);
-      constraints.stop_at_time = pmark.key.trace_time;
       current->replay_step(constraints);
     } else {
       ReplayTask* t = current->current_task();
@@ -704,7 +701,7 @@ bool ReplayTimeline::add_breakpoint(
   if (!t->vm()->add_breakpoint(addr, BKPT_USER)) {
     return false;
   }
-  breakpoints.insert(make_tuple(t->vm()->uid(), addr, move(condition)));
+  breakpoints.insert(make_tuple(t->vm()->uid(), addr, std::move(condition)));
   return true;
 }
 
@@ -737,7 +734,7 @@ bool ReplayTimeline::add_watchpoint(ReplayTask* t, remote_ptr<void> addr,
     return false;
   }
   watchpoints.insert(
-      make_tuple(t->vm()->uid(), addr, num_bytes, type, move(condition)));
+      make_tuple(t->vm()->uid(), addr, num_bytes, type, std::move(condition)));
   no_watchpoints_hit_interval_start = no_watchpoints_hit_interval_end =
       Mark();
   return true;
@@ -865,7 +862,6 @@ bool ReplayTimeline::run_forward_to_intermediate_point(const Mark& end,
   FrameTime mid = (now + end.ptr->proto.key.trace_time) / 2;
   if (now < mid && mid < end.ptr->proto.key.trace_time) {
     ReplaySession::StepConstraints constraints(RUN_CONTINUE);
-    constraints.stop_at_time = mid;
     while (current->trace_reader().time() < mid) {
       current->replay_step(constraints);
     }
@@ -877,7 +873,6 @@ bool ReplayTimeline::run_forward_to_intermediate_point(const Mark& end,
   if (current->trace_reader().time() < end.ptr->proto.key.trace_time &&
       end.ptr->ticks_at_event_start < end.ptr->proto.key.ticks) {
     ReplaySession::StepConstraints constraints(RUN_CONTINUE);
-    constraints.stop_at_time = end.ptr->proto.key.trace_time;
     while (current->trace_reader().time() < end.ptr->proto.key.trace_time) {
       current->replay_step(constraints);
     }
@@ -943,7 +938,7 @@ bool ReplayTimeline::run_forward_to_intermediate_point(const Mark& end,
     ReplayResult result = current->replay_step(constraints);
     if (at_mark(end)) {
       DEBUG_ASSERT(tmp_session);
-      current = move(tmp_session);
+      current = std::move(tmp_session);
       LOG(debug) << "Singlestepping arrived at |end|, restoring session";
     } else if (!m.equal_states(*current)) {
       LOG(debug) << "Did fast-singlestep forward to " << current_mark_key();
@@ -981,12 +976,13 @@ static bool arch_watch_fires_before_instr(SupportedArch arch) {
 }
 
 ReplayResult ReplayTimeline::reverse_continue(
-    const std::function<bool(ReplayTask* t)>& stop_filter,
+    const std::function<bool(ReplayTask* t, const BreakStatus &)>& stop_filter,
     const std::function<bool()>& interrupt_check) {
   Mark end = mark();
   LOG(debug) << "ReplayTimeline::reverse_continue from " << end;
 
-  bool last_stop_is_watch_or_signal = false;
+  bool last_stop_is_watch = false;
+  bool last_stop_is_signal = false;
   ReplayResult final_result;
   TaskUid final_tuid;
   Ticks final_ticks = 0;
@@ -1015,7 +1011,7 @@ ReplayResult ReplayTimeline::reverse_continue(
         seek_to_mark(seek);
         LOG(debug) << "Seeked directly backward from " << start << " to "
                    << seek;
-        start = move(seek);
+        start = std::move(seek);
       }
     } else {
       checkpoint_at_first_break = false;
@@ -1061,10 +1057,11 @@ ReplayResult ReplayTimeline::reverse_continue(
         avoidable_stop_ip = result.break_status.task()->ip();
         avoidable_stop_ticks = result.break_status.task()->tick_count();
       }
+      before_watchpoint = false;
 
       evaluate_conditions(result);
       if (result.break_status.any_break() &&
-          !stop_filter(to_replay_task(result.break_status))) {
+          !stop_filter(to_replay_task(result.break_status), result.break_status)) {
         result.break_status = BreakStatus();
       }
 
@@ -1080,12 +1077,16 @@ ReplayResult ReplayTimeline::reverse_continue(
         dest = mark();
         if (result.break_status.signal) {
           LOG(debug) << "Found signal break at " << dest;
+          last_stop_is_watch = false;
+          last_stop_is_signal = true;
         } else {
           LOG(debug) << "Found watch break at " << dest << ", addr="
                      << result.break_status.data_watchpoints_hit()[0].addr;
           if (arch_watch_fires_before_instr(current->arch())) {
             before_watchpoint = true;
           }
+          last_stop_is_signal = false;
+          last_stop_is_watch = true;
         }
         final_result = result;
         final_tuid = result.break_status.task()
@@ -1094,7 +1095,6 @@ ReplayResult ReplayTimeline::reverse_continue(
         final_ticks = result.break_status.task()
                           ? result.break_status.task()->tick_count()
                           : 0;
-        last_stop_is_watch_or_signal = true;
       }
       DEBUG_ASSERT(result.status == REPLAY_CONTINUE);
 
@@ -1106,7 +1106,8 @@ ReplayResult ReplayTimeline::reverse_continue(
         final_result.break_status.task_exit = true;
         final_tuid = final_result.break_status.task()->tuid();
         final_ticks = result.break_status.task()->tick_count();
-        last_stop_is_watch_or_signal = false;
+        last_stop_is_watch = false;
+        last_stop_is_signal = false;
       }
 
       if (at_mark(end)) {
@@ -1127,7 +1128,8 @@ ReplayResult ReplayTimeline::reverse_continue(
         final_ticks = result.break_status.task()
                           ? result.break_status.task()->tick_count()
                           : 0;
-        last_stop_is_watch_or_signal = false;
+        last_stop_is_watch = false;
+        last_stop_is_signal = false;
       }
 
       if (interrupt_check()) {
@@ -1165,12 +1167,23 @@ ReplayResult ReplayTimeline::reverse_continue(
     }
   }
 
-  if (last_stop_is_watch_or_signal) {
-    LOG(debug)
+  if (last_stop_is_watch || last_stop_is_signal) {
+    if (last_stop_is_watch && arch_watch_fires_before_instr(current->arch())) {
+      // GDB expect reverse continue to stop before reversing past the watchpoint
+      // (i.e. pc points to end of instruction) on aarch64
+      // but the dest is pointing to the beginning of the instruction
+      // so we need to single step the instruction at dest.
+      LOG(debug) << "Single step past the watchpoint" << dest;
+      seek_to_mark(dest);
+      unapply_breakpoints_and_watchpoints();
+      current->replay_step(RUN_SINGLESTEP);
+    } else {
+      LOG(debug)
         << "Performing final reverse-singlestep to pass over watch/signal";
-    auto stop_filter = [&](ReplayTask* t) { return t->tuid() == final_tuid; };
-    reverse_singlestep(dest, final_tuid, final_ticks, stop_filter,
-                       interrupt_check);
+      auto stop_filter = [&](ReplayTask* t,const BreakStatus &) { return t->tuid() == final_tuid; };
+      reverse_singlestep(dest, final_tuid, final_ticks, stop_filter,
+                         interrupt_check);
+    }
   } else {
     LOG(debug) << "Seeking to final destination " << dest;
     seek_to_mark(dest);
@@ -1196,7 +1209,7 @@ void ReplayTimeline::update_observable_break_status(
 
 ReplayResult ReplayTimeline::reverse_singlestep(
     const Mark& origin, const TaskUid& step_tuid, Ticks step_ticks,
-    const std::function<bool(ReplayTask* t)>& stop_filter,
+    const std::function<bool(ReplayTask* t,const BreakStatus &)>& stop_filter,
     const std::function<bool()>& interrupt_check) {
   LOG(debug) << "ReplayTimeline::reverse_singlestep from " << origin;
 
@@ -1239,7 +1252,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
       bool seen_other_task_break = false;
       while (!at_mark(end)) {
         ReplayTask* t = current->current_task();
-        if (stop_filter(t) && current->done_initial_exec()) {
+        if (stop_filter(t, BreakStatus()) && current->done_initial_exec()) {
           if (t->tuid() == step_tuid) {
             if (t->tick_count() >= ticks_target) {
               // Don't step any further.
@@ -1293,7 +1306,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
       }
       end = start;
     }
-    DEBUG_ASSERT(stop_filter(current->current_task()) || seen_barrier);
+    DEBUG_ASSERT(stop_filter(current->current_task(), BreakStatus()) || seen_barrier);
 
     Mark destination_candidate;
     Mark step_start = set_short_checkpoint();
@@ -1314,7 +1327,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
     while (true) {
       Mark now;
       ReplayResult result;
-      if (stop_filter(current->current_task())) {
+      if (stop_filter(current->current_task(), BreakStatus())) {
         apply_breakpoints_and_watchpoints();
         if (current->current_task()->tuid() == step_tuid) {
           Mark before_step = mark();
@@ -1322,8 +1335,13 @@ ReplayResult ReplayTimeline::reverse_singlestep(
               RUN_SINGLESTEP_FAST_FORWARD);
           constraints.stop_before_states.push_back(&end.ptr->proto.regs);
           result = current->replay_step(constraints);
+          ReplayResult result_with_breakpoints_and_watchpoints = result;
           update_observable_break_status(now, result);
-          if (result.break_status.hardware_or_software_breakpoint_hit()) {
+          bool stopped_before_watchpoint =
+            !result.break_status.data_watchpoints_hit().empty() &&
+            arch_watch_fires_before_instr(current->arch());
+          if (result.break_status.hardware_or_software_breakpoint_hit() ||
+              stopped_before_watchpoint) {
             // If we hit a breakpoint while singlestepping, we didn't
             // make any progress.
             unapply_breakpoints_and_watchpoints();
@@ -1345,10 +1363,18 @@ ReplayResult ReplayTimeline::reverse_singlestep(
                          << " pretending we stopped earlier.";
               break;
             }
-            destination_candidate = step_start;
+            if (stopped_before_watchpoint) {
+              // On ARM, watchpoints fire before the instruction executes.
+              // This instruction triggered the watchpoint so we need to
+              // stop before the instruction is reverse-executed, i.e. after
+              // it actually executed.
+              destination_candidate = now;
+            } else {
+              destination_candidate = step_start;
+            }
             LOG(debug) << "Setting candidate after step: "
                        << destination_candidate;
-            destination_candidate_result = result;
+            destination_candidate_result = result_with_breakpoints_and_watchpoints;
             destination_candidate_tuid = result.break_status.task()->tuid();
             destination_candidate_saw_other_task_break = seen_other_task_break;
             seen_other_task_break = false;
@@ -1360,7 +1386,9 @@ ReplayResult ReplayTimeline::reverse_singlestep(
           if (result.break_status.any_break()) {
             seen_other_task_break = true;
           }
-          if (result.break_status.hardware_or_software_breakpoint_hit()) {
+          if (result.break_status.hardware_or_software_breakpoint_hit() ||
+              (!result.break_status.data_watchpoints_hit().empty() &&
+               arch_watch_fires_before_instr(current->arch()))) {
             unapply_breakpoints_and_watchpoints();
             result = current->replay_step(RUN_SINGLESTEP_FAST_FORWARD);
             update_observable_break_status(now, result);
@@ -1467,8 +1495,7 @@ void ReplayTimeline::evaluate_conditions(ReplayResult& result) {
   }
 }
 
-ReplayResult ReplayTimeline::replay_step_forward(RunCommand command,
-                                                 FrameTime stop_at_time) {
+ReplayResult ReplayTimeline::replay_step_forward(RunCommand command) {
   DEBUG_ASSERT(command != RUN_SINGLESTEP_FAST_FORWARD);
 
   ReplayResult result;
@@ -1476,7 +1503,6 @@ ReplayResult ReplayTimeline::replay_step_forward(RunCommand command,
   ProtoMark before = proto_mark();
   current->set_visible_execution(true);
   ReplaySession::StepConstraints constraints(command);
-  constraints.stop_at_time = stop_at_time;
   result = current->replay_step(constraints);
   current->set_visible_execution(false);
   if (command == RUN_CONTINUE) {
@@ -1506,7 +1532,7 @@ ReplayResult ReplayTimeline::replay_step_forward(RunCommand command,
 
 ReplayResult ReplayTimeline::reverse_singlestep(
     const TaskUid& tuid, Ticks tuid_ticks,
-    const std::function<bool(ReplayTask* t)>& stop_filter,
+    const std::function<bool(ReplayTask* t, const BreakStatus &)>& stop_filter,
     const std::function<bool()>& interrupt_check) {
   return reverse_singlestep(mark(), tuid, tuid_ticks, stop_filter,
                             interrupt_check);

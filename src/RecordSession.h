@@ -51,7 +51,7 @@ struct TraceUuid {
 };
 
 /** Encapsulates additional session state related to recording. */
-class RecordSession : public Session {
+class RecordSession final : public Session {
 public:
   typedef std::shared_ptr<RecordSession> shr_ptr;
 
@@ -65,12 +65,17 @@ public:
       const DisableCPUIDFeatures& features,
       SyscallBuffering syscallbuf = ENABLE_SYSCALL_BUF,
       unsigned char syscallbuf_desched_sig = SIGPWR,
-      BindCPU bind_cpu = BIND_CPU,
+      BindCPU bind_cpu = BindCPU(BindCPU::ANY),
       const std::string& output_trace_dir = "",
       const TraceUuid* trace_id = nullptr,
       bool use_audit = false,
       bool unmap_vdso = false,
-      bool force_asan_active = false);
+      bool force_asan_active = false,
+      bool force_tsan_active = false,
+      bool intel_pt = false,
+      bool check_outside_mmaps = false);
+
+  ~RecordSession() override;
 
   const DisableCPUIDFeatures& disable_cpuid_features() const {
     return disable_cpuid_features_;
@@ -84,10 +89,17 @@ public:
   int get_ignore_sig() const { return ignore_sig; }
   void set_continue_through_sig(int sig) { continue_through_sig = sig; }
   int get_continue_through_sig() const { return continue_through_sig; }
-  void set_asan_active(bool active) { asan_active_ = active; }
-  bool asan_active() const { return asan_active_; }
+  // Returns ranges to exclude from chaos mode memory allocation.
+  // Used to exclude ranges used by sanitizers.
+  const std::vector<MemoryRange> excluded_ranges() const {
+    return excluded_ranges_;
+  }
+  MemoryRange fixed_global_exclusion_range() const {
+    return fixed_global_exclusion_range_;
+  }
   bool use_audit() const { return use_audit_; }
   bool unmap_vdso() { return unmap_vdso_; }
+  bool check_outside_mmaps() { return check_outside_mmaps_; }
   uint64_t rr_signal_mask() const;
 
   enum RecordStatus {
@@ -133,8 +145,6 @@ public:
 
   TraceWriter& trace_writer() { return trace_out; }
 
-  virtual void on_destroy(Task* t) override;
-
   Scheduler& scheduler() { return scheduler_; }
 
   SeccompFilterRewriter& seccomp_filter_rewriter() {
@@ -168,10 +178,11 @@ public:
   }
 
   virtual Task* new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
-                         SupportedArch a) override;
+                         SupportedArch a, const std::string& name) override;
 
   RecordTask* find_task(pid_t rec_tid) const;
   RecordTask* find_task(const TaskUid& tuid) const;
+  RecordTask* find_detached_proxy_task(pid_t proxy_tid) const;
 
   void on_proxy_detach(RecordTask *t, pid_t new_tid);
 
@@ -193,6 +204,13 @@ public:
    */
   void term_detached_tasks();
 
+  /**
+   * Forward SIGTERM to initial task
+   */
+  void forward_SIGTERM();
+
+  void on_destroy_record_task(RecordTask* t);
+
 private:
   RecordSession(const std::string& exe_path,
                 const std::vector<std::string>& argv,
@@ -204,7 +222,9 @@ private:
                 const std::string& output_trace_dir,
                 const TraceUuid* trace_id,
                 bool use_audit,
-                bool unmap_vdso);
+                bool unmap_vdso,
+                bool intel_pt,
+                bool check_outside_mmaps);
 
   virtual void on_create(Task* t) override;
 
@@ -217,6 +237,10 @@ private:
                              RecordResult* step_result,
                              SupportedArch syscall_arch);
   void check_initial_task_syscalls(RecordTask* t, RecordResult* step_result);
+  void handle_seccomp_trap(RecordTask* t, StepState* step_state,
+                           uint16_t seccomp_data);
+  void handle_seccomp_errno(RecordTask* t, StepState* step_state,
+                            uint16_t seccomp_data);
   bool handle_ptrace_event(RecordTask** t_ptr, StepState* step_state,
                            RecordResult* result, bool* did_enter_syscall);
   bool handle_signal_event(RecordTask* t, StepState* step_state);
@@ -249,16 +273,23 @@ private:
    * When true, try to increase the probability of finding bugs.
    */
   bool enable_chaos_;
-  bool asan_active_;
   /**
    * When true, wait for all tracees to exit before finishing recording.
    */
   bool wait_for_all_;
 
+  std::vector<MemoryRange> excluded_ranges_;
+  MemoryRange fixed_global_exclusion_range_;
+  /**
+   * Keeps track of detached tasks.
+   */
+  std::map<pid_t, RecordTask*> detached_task_map;
+
   std::string output_trace_dir;
 
   bool use_audit_;
   bool unmap_vdso_;
+  bool check_outside_mmaps_;
 };
 
 } // namespace rr

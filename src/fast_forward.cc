@@ -144,14 +144,14 @@ static void bound_iterations_for_watchpoint(Task* t, remote_ptr<void> reg,
   uintptr_t steps;
   if (direction > 0) {
     if (watch.addr < reg) {
-      // We're assuming wraparound can't happpen!
+      // We're assuming wraparound can't happen!
       return;
     }
     // We'll hit the first byte of the watchpoint moving forward.
     steps = (watch.addr - reg) / size;
   } else {
     if (watch.addr > reg) {
-      // We're assuming wraparound can't happpen!
+      // We're assuming wraparound can't happen!
       return;
     }
     // We'll hit the last byte of the watchpoint moving backward.
@@ -168,7 +168,8 @@ FastForwardStatus fast_forward_through_instruction(Task* t, ResumeRequest how,
 
   remote_code_ptr ip = t->ip();
 
-  t->resume_execution(how, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
+  bool ok = t->resume_execution(how, RESUME_WAIT_NO_EXIT, RESUME_UNLIMITED_TICKS);
+  ASSERT(t, ok) << "Tracee was killed";
   if (t->stop_sig() != SIGTRAP) {
     // we might have stepped into a system call...
     return result;
@@ -310,13 +311,14 @@ FastForwardStatus fast_forward_through_instruction(Task* t, ResumeRequest how,
     // So, disable watchpoints temporarily.
     t->vm()->save_watchpoints();
     t->vm()->remove_all_watchpoints();
-    t->resume_execution(RESUME_CONT, RESUME_WAIT, RESUME_UNLIMITED_TICKS);
+    ok = t->resume_execution(RESUME_CONT, RESUME_WAIT_NO_EXIT, RESUME_UNLIMITED_TICKS);
+    ASSERT(t, ok) << "Tracee was killed";
     t->vm()->restore_watchpoints();
     t->vm()->remove_breakpoint(limit_ip, BKPT_INTERNAL);
     result.did_fast_forward = true;
     // We should have reached the breakpoint
     ASSERT(t, t->stop_sig() == SIGTRAP);
-    ASSERT(t, t->ip() == limit_ip.increment_by_bkpt_insn_length(t->arch()));
+    ASSERT(t, t->ip().undo_executed_bkpt(t->arch()) == limit_ip);
     uintptr_t iterations_performed = iterations - t->regs().cx();
     tmp = t->regs();
     // Undo our change to CX value
@@ -402,7 +404,8 @@ static int fallible_read_byte(Task* t, remote_ptr<uint8_t> ip) {
   return byte;
 }
 
-bool is_string_instruction_at(Task* t, remote_code_ptr ip) {
+#if defined(__i386__) || defined(__x86_64__)
+bool is_x86_string_instruction_at(Task* t, remote_code_ptr ip) {
   bool found_rep = false;
   remote_ptr<uint8_t> bare_ip = ip.to_data_ptr<uint8_t>();
   while (true) {
@@ -419,6 +422,7 @@ bool is_string_instruction_at(Task* t, remote_code_ptr ip) {
     ++bare_ip;
   }
 }
+#endif
 
 static bool is_string_instruction_before(Task* t, remote_code_ptr ip) {
   remote_ptr<uint8_t> bare_ip = ip.to_data_ptr<uint8_t>();
@@ -445,7 +449,7 @@ bool maybe_at_or_after_x86_string_instruction(Task* t) {
     return false;
   }
 
-  return is_string_instruction_at(t, t->ip()) ||
+  return is_x86_string_instruction_at(t, t->ip()) ||
          is_string_instruction_before(t, t->ip());
 }
 
@@ -454,7 +458,7 @@ bool at_x86_string_instruction(Task* t) {
     return false;
   }
 
-  return is_string_instruction_at(t, t->ip());
+  return is_x86_string_instruction_at(t, t->ip());
 }
 
 } // namespace rr

@@ -132,7 +132,7 @@ public:
    * This is usually called automatically by the destructor;
    * don't call it directly unless you really know what you'd
    * doing.  *ESPECIALLY* don't call this on a |t| other than
-   * the one passed to the contructor, unless you really know
+   * the one passed to the constructor, unless you really know
    * what you're doing.
    */
   void restore_state_to(Task* t);
@@ -150,6 +150,8 @@ public:
     return syscall_helper<1>(syscallno, callregs, args...);
   }
 
+  // Aborts on all errors.
+  // DEPRECATED. Use infallible_syscall_if_alive instead.
   template <typename... Rest>
   long infallible_syscall(int syscallno, Rest... args) {
     Registers callregs = regs();
@@ -157,10 +159,12 @@ public:
     // our syscall-arg-index template parameter starts
     // with "1".
     long ret = syscall_helper<1>(syscallno, callregs, args...);
-    check_syscall_result(ret, syscallno);
+    check_syscall_result(ret, syscallno, false);
     return ret;
   }
 
+  // Aborts on all errors other than -ESRCH. Aborts on -ESRCH
+  // if this is a replay task (they should never unexpectedly die).
   template <typename... Rest>
   long infallible_syscall_if_alive(int syscallno, Rest... args) {
     Registers callregs = regs();
@@ -168,27 +172,49 @@ public:
     // our syscall-arg-index template parameter starts
     // with "1".
     long ret = syscall_helper<1>(syscallno, callregs, args...);
-    check_syscall_result(ret, syscallno, true);
+    check_syscall_result(ret, syscallno);
     return ret;
   }
 
+  /** Returns null if the tracee is dead */
   template <typename... Rest>
-  remote_ptr<void> infallible_syscall_ptr(int syscallno, Rest... args) {
+  remote_ptr<void> infallible_syscall_ptr_if_alive(int syscallno, Rest... args) {
     Registers callregs = regs();
     long ret = syscall_helper<1>(syscallno, callregs, args...);
     check_syscall_result(ret, syscallno);
-    return ret;
+    return ret == -ESRCH ? 0 : ret;
   }
 
   /**
    * Remote mmap syscalls are common and non-trivial due to the need to
    * select either mmap2 or mmap.
+   * Returns null if the process died (or was already dead) without
+   * creating the map. "Dead" includes reaching PTRACE_EVENT_EXIT.
+   * If the mapping is FIXED and no mapping currently exists at the address,
+   * and the syscall creates the mapping but the process dies before returning
+   * success, we fix the result to indicate that the syscall succeeded.
+   * Creating FIXED mappings in areas free according to AddressSpace is the only
+   * reliable way to keep AddressSpace in sync with reality in the event of
+   * unexpected process death racing with this operation.
    */
-  remote_ptr<void> infallible_mmap_syscall(remote_ptr<void> addr, size_t length,
-                                           int prot, int flags, int child_fd,
-                                           uint64_t offset_pages);
+  remote_ptr<void> infallible_mmap_syscall_if_alive(remote_ptr<void> addr, size_t length,
+                                                    int prot, int flags, int child_fd,
+                                                    uint64_t offset_bytes);
 
+  /**
+   * Returns false if the process died (or was already dead) without
+   * unmapping the area. "Dead" includes reaching PTRACE_EVENT_EXIT.
+   * If a mapping currently exists at the address, and the syscall unmaps
+   * the mapping but the process dies before returning success, we fix
+   * the result to indicate that the syscall succeeded.
+   */
+  bool infallible_munmap_syscall_if_alive(remote_ptr<void> addr, size_t length);
+
+  /** TODO replace with infallible_lseek_syscall_if_alive */
   int64_t infallible_lseek_syscall(int fd, int64_t offset, int whence);
+
+  /** Close the fd in the child. If the child died, just ignore that. */
+  void infallible_close_syscall_if_alive(int child_fd);
 
   /** The Task in the context of which we're making syscalls. */
   Task* task() const { return t; }
@@ -210,15 +236,25 @@ public:
    * Arranges for 'fd' to be transmitted to the tracee and returns
    * a file descriptor in the tracee that corresponds to the same file
    * description.
-   * Returns a negative value if the process dies or has died.
+   * Returns a negative value if this fails.
    */
   int send_fd(const ScopedFd &fd);
 
   /**
+   * Arranges for 'fd' to be transmitted to the tracee and returns
+   * a file descriptor in the tracee that corresponds to the same file
+   * description.
+   * Aborts if that fails.
+   * Returns -ESRCH if the tracee is dead (and is not replaying)
+   */
+  int infallible_send_fd_if_alive(const ScopedFd& our_fd);
+
+  /**
    * `send_fd` the given file descriptor, making sure that it ends up as fd
    * `dup_to`, (dup'ing it there and closing the original if necessary)
+   * TODO replace with infallible_send_fd_dup_if_alive
    */
-  void infallible_send_fd_dup(const ScopedFd& our_fd, int dup_to);
+  void infallible_send_fd_dup(const ScopedFd& our_fd, int dup_to, int dup3_flags);
 
   /**
    * Remotely invoke in |t| the specified syscall with the given
@@ -242,13 +278,15 @@ public:
                           int prot, int flags,
                           const std::string& backing_file_name,
                           int backing_file_open_flags,
-                          off64_t backing_offset_pages,
+                          off_t backing_offset_bytes,
                           struct stat& real_file, std::string& real_file_name);
+
+  // Calling this with allow_death false is DEPRECATED.
+  // Returns true iff session was not replaying and allow_death is true and process is not alive (-ESRCH)
+  bool check_syscall_result(long ret, int syscallno, bool allow_death = true);
 
 private:
   void setup_path(bool enable_singlestep_path);
-
-  void check_syscall_result(long ret, int syscallno, bool allow_death=false);
 
   /**
    * "Recursively" build the set of syscall registers in
@@ -279,6 +317,7 @@ private:
   remote_ptr<void> fixed_sp;
   std::vector<uint8_t> replaced_bytes;
   WaitStatus restore_wait_status;
+  ScopedFd pid_fd;
 
   pid_t new_tid_;
   /* Whether we had to mmap a scratch region because none was found */
@@ -286,6 +325,12 @@ private:
   bool use_singlestep_path;
 
   MemParamsEnabled enable_mem_params_;
+
+  bool restore_sigmask;
+  sig_set_t sigmask_to_restore;
+
+  bool need_sigpending_renable;
+  bool need_desched_event_reenable;
 
   AutoRemoteSyscalls& operator=(const AutoRemoteSyscalls&) = delete;
   AutoRemoteSyscalls(const AutoRemoteSyscalls&) = delete;

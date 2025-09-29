@@ -11,6 +11,7 @@
 
 #include "AddressSpace.h"
 #include "Command.h"
+#include "Flags.h"
 #include "RecordSession.h"
 #include "ReplaySession.h"
 #include "ReplayTask.h"
@@ -96,9 +97,33 @@ static int dump_trace_info(const string& trace_dir, FILE* out) {
     }
   }
 
+  uint8_t max_virtual_address_size = trace.max_virtual_address_size();
+  if (max_virtual_address_size > 0) {
+    fprintf(out, "  \"maxVirtualAddressSize\":%d,\n", max_virtual_address_size);
+  }
+
+  bool cpu_improperly_configured_known;
+  bool cpu_improperly_configured = trace.cpu_improperly_configured(&cpu_improperly_configured_known);
+  if (cpu_improperly_configured_known) {
+    fprintf(out, "  \"cpuImproperlyConfigured\":%s,\n", cpu_improperly_configured ? "true" : "false");
+  }
+
+  if (!trace.uname().sysname.empty()) {
+    const auto& uname = trace.uname();
+    fputs("  \"uname\":{", out);
+    fprintf(out, "\n    \"sysname\":\"%s\",", json_escape(uname.sysname).c_str());
+    fprintf(out, "\n    \"nodename\":\"%s\",", json_escape(uname.nodename).c_str());
+    fprintf(out, "\n    \"release\":\"%s\",", json_escape(uname.release).c_str());
+    fprintf(out, "\n    \"version\":\"%s\",", json_escape(uname.version).c_str());
+    fprintf(out, "\n    \"machine\":\"%s\",", json_escape(uname.machine).c_str());
+    fprintf(out, "\n    \"domainname\":\"%s\"", json_escape(uname.domainname).c_str());
+    fputs("\n  },\n", out);
+  }
+
   ReplaySession::Flags flags;
   flags.redirect_stdio = false;
   flags.share_private_mappings = false;
+  flags.replay_stops_at_first_execve = true;
   flags.cpu_unbound = true;
   ReplaySession::shr_ptr replay_session = ReplaySession::create(trace_dir, flags);
 
@@ -113,7 +138,10 @@ static int dump_trace_info(const string& trace_dir, FILE* out) {
         }
         fprintf(out, "\n    \"%s\"", json_escape(environ[i]).c_str());
       }
-      fputs("\n  ]\n", out);
+      fputs("\n  ],\n", out);
+
+      fprintf(out, "  \"program\": \"%s\"\n", json_escape(replay_session->vms()[0]->exe_image()).c_str());
+
       break;
     }
     if (result.status == REPLAY_EXITED) {
@@ -128,6 +156,10 @@ static int dump_trace_info(const string& trace_dir, FILE* out) {
 }
 
 int TraceInfoCommand::run(vector<string>& args) {
+  // Various "cannot replay safely..." warnings cannot affect us since
+  // we only replay to the first execve.
+  Flags::get_for_init().suppress_environment_warnings = true;
+
   while (parse_global_option(args)) {
   }
 

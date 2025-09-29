@@ -27,9 +27,9 @@ class ReplaySession;
  * feature.  A diversion is created for the call frame, then discarded
  * when the call finishes (loosely speaking).
  */
-class DiversionSession : public Session {
+class DiversionSession final : public Session {
 public:
-  DiversionSession();
+  DiversionSession(BindCPU cpu_binding);
 
   typedef std::shared_ptr<DiversionSession> shr_ptr;
 
@@ -54,14 +54,19 @@ public:
                                  int signal_to_deliver = 0);
 
   virtual DiversionSession* as_diversion() override { return this; }
+  virtual BindCPU cpu_binding() const override { return cpu_binding_; }
 
   void set_tracee_fd_number(int fd_number) { tracee_socket_fd_number = fd_number; }
   void on_create(Task *t) override { this->Session::on_create(t); }
+
+  uint64_t next_timer_counter();
 
 private:
   friend class ReplaySession;
 
   std::shared_ptr<EmuFs> emu_fs;
+  uint64_t fake_timer_counter;
+  BindCPU cpu_binding_;
 };
 
 } // namespace rr

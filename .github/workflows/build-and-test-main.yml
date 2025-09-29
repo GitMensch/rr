@@ -1,0 +1,49 @@
+name: Build and test
+
+on: [push, pull_request]
+
+jobs:
+  setup:
+    name: Setup runners
+    runs-on: ubuntu-latest
+    if: github.repository == 'rr-debugger/rr'
+    steps:
+      - id: generate
+        name: Generate runner label
+        run: |
+          RUNNER_LABEL=rr_runner_$(uuidgen|tr -d -)
+          echo "RUNNER_LABEL=$RUNNER_LABEL" >> "$GITHUB_OUTPUT"
+      - name: Start runners
+        run: |2-
+          curl --fail -s -X POST -H "Content-Type: application/json" --data "{\"operation\": \"create\", \"architectures\":[\"x86_64\", \"arm64\"], \"label\": \"${{ steps.generate.outputs.RUNNER_LABEL }}\"}" https://bqugdqmvcql6yvz4i362qohyea0namsk.lambda-url.us-east-2.on.aws
+    outputs:
+      RUNNER_LABEL: ${{ steps.generate.outputs.RUNNER_LABEL }}
+
+  x86-64:
+    uses: ./.github/workflows/build-and-test.yml
+    needs: setup
+    if: github.repository == 'rr-debugger/rr'
+    with:
+      label: ${{ needs.setup.outputs.RUNNER_LABEL }}
+      architecture: x86_64
+
+  arm64:
+    uses: ./.github/workflows/build-and-test.yml
+    needs: setup
+    if: github.repository == 'rr-debugger/rr'
+    with:
+      label: ${{ needs.setup.outputs.RUNNER_LABEL }}
+      architecture: arm64
+
+  stop-runners:
+    name: Stop runners
+    runs-on: ubuntu-latest
+    needs:
+      - setup
+      - x86-64
+      - arm64
+    if: ${{ always() && github.repository == 'rr-debugger/rr' }}
+    steps:
+      - name: "Stop runners"
+        run: |2-
+          curl --fail -s -X POST -H "Content-Type: application/json" --data "{\"operation\": \"destroy\", \"label\": \"${{ needs.setup.outputs.RUNNER_LABEL }}\"}" https://bqugdqmvcql6yvz4i362qohyea0namsk.lambda-url.us-east-2.on.aws

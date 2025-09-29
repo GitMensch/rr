@@ -14,6 +14,6 @@ expect_gdb('SIGSEGV')
 send_gdb('reverse-stepi')
 expect_gdb('SIGSEGV')
 send_gdb('reverse-continue')
-expect_gdb('stopped')
+expect_history_end()
 
 ok()

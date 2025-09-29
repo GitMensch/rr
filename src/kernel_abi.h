@@ -8,7 +8,10 @@
 #include <vector>
 
 #include "core.h"
+#include "log.h"
 #include "remote_ptr.h"
+
+#undef loff_t
 
 namespace rr {
 
@@ -31,6 +34,8 @@ inline bool is_x86ish(SupportedArch arch_) {
   return arch_ == x86 || arch_ == x86_64;
 }
 
+int to_audit_arch(SupportedArch arch);
+
 template <SupportedArch a, typename system_type, typename rr_type>
 struct Verifier {
   // Optimistically say we are the same size.
@@ -50,7 +55,7 @@ template <typename T> struct Verifier<RR_NATIVE_ARCH, T, T> {
 // We want verify that the types have the same size as their
 // counterparts in the system header. To avoid having to include
 // all system headers here, we instead make the verification macros
-// a no-op unless inlcuded from kernel_abi.cc.
+// a no-op unless included from kernel_abi.cc.
 #ifndef RR_VERIFY_TYPE
 #define RR_VERIFY_TYPE_ARCH(arch_, system_type_, rr_type_) // no-op
 #define RR_VERIFY_TYPE_EXPLICIT(system_type_, rr_type_)    // no-op
@@ -64,6 +69,70 @@ template <typename T> struct Verifier<RR_NATIVE_ARCH, T, T> {
 #endif
 
 struct KernelConstants {
+  // These are the same across all architectures. The kernel defines them for
+  // all architectures in the uapi headers, but the libc's headers may not.
+  // Further, the libc headers may conflict with the kernel headers, so for
+  // simplicity, we just define everything here:
+  static const int PTRACE_TRACEME = 0;
+  static const int PTRACE_PEEKTEXT = 1;
+  static const int PTRACE_PEEKDATA = 2;
+  static const int PTRACE_PEEKUSR = 3;
+  // PEEKUSER is a libc alias.
+  static const int PTRACE_PEEKUSER = PTRACE_PEEKUSR;
+  static const int PTRACE_POKETEXT = 4;
+  static const int PTRACE_POKEDATA = 5;
+  static const int PTRACE_POKEUSR = 6;
+  // POKEUSER is a libc alias.
+  static const int PTRACE_POKEUSER = PTRACE_POKEUSR;
+  static const int PTRACE_CONT = 7;
+  static const int PTRACE_KILL = 8;
+  static const int PTRACE_SINGLESTEP = 9;
+  // PTRACE_GETREGS actually does vary but it's 12 on every arch we care about.
+  static const int PTRACE_GETREGS = 12;
+  static const int PTRACE_GETFPREGS = 14;
+  static const int PTRACE_SETFPREGS = 15;
+  static const int PTRACE_ATTACH = 16;
+  static const int PTRACE_DETACH = 17;
+  static const int PTRACE_SYSCALL = 24;
+  static const int PTRACE_SETOPTIONS = 0x4200;
+  static const int PTRACE_GETEVENTMSG = 0x4201;
+  static const int PTRACE_GETSIGINFO = 0x4202;
+  static const int PTRACE_SETSIGINFO = 0x4203;
+  static const int PTRACE_GETREGSET = 0x4204;
+  static const int PTRACE_SETREGSET = 0x4205;
+  static const int PTRACE_SEIZE = 0x4206;
+  static const int PTRACE_INTERRUPT = 0x4207;
+  static const int PTRACE_LISTEN = 0x4208;
+  static const int PTRACE_GETSIGMASK = 0x420a;
+  static const int PTRACE_SETSIGMASK = 0x420b;
+  static const int PTRACE_GET_SYSCALL_INFO = 0x420e;
+
+  static const int PTRACE_EVENT_NONE = 0;
+  static const int PTRACE_EVENT_FORK = 1;
+  static const int PTRACE_EVENT_VFORK = 2;
+  static const int PTRACE_EVENT_CLONE = 3;
+  static const int PTRACE_EVENT_EXEC = 4;
+  static const int PTRACE_EVENT_VFORK_DONE = 5;
+  static const int PTRACE_EVENT_EXIT = 6;
+  static const int PTRACE_EVENT_SECCOMP = 7; // ubuntu 12.10 and future kernels
+  static const int PTRACE_EVENT_SECCOMP_OBSOLETE = 8; // ubuntu 12.04
+  static const int PTRACE_EVENT_STOP = 128;
+
+  static const int PTRACE_O_TRACESYSGOOD = 1;
+  static const int PTRACE_O_TRACEFORK = 1 << PTRACE_EVENT_FORK;
+  static const int PTRACE_O_TRACEVFORK = 1 << PTRACE_EVENT_VFORK;
+  static const int PTRACE_O_TRACECLONE = 1 << PTRACE_EVENT_CLONE;
+  static const int PTRACE_O_TRACEEXEC = 1 << PTRACE_EVENT_EXEC;
+  static const int PTRACE_O_TRACEVFORKDONE = 1 << PTRACE_EVENT_VFORK_DONE;
+  static const int PTRACE_O_TRACEEXIT = 1 << PTRACE_EVENT_EXIT;
+  static const int PTRACE_O_TRACESECCOMP = 1 << PTRACE_EVENT_SECCOMP;
+  static const int PTRACE_O_EXITKILL = 1 << 20;
+
+  static const int PTRACE_SYSCALL_INFO_NONE = 0;
+  static const int PTRACE_SYSCALL_INFO_ENTRY = 1;
+  static const int PTRACE_SYSCALL_INFO_EXIT = 2;
+  static const int PTRACE_SYSCALL_INFO_SECCOMP = 3;
+
   static const ::size_t SIGINFO_MAX_SIZE = 128;
 
   // These types are the same size everywhere.
@@ -108,6 +177,8 @@ struct FcntlConstants {
     OFD_SETLK = 37,
     OFD_SETLKW = 38,
     // Other Linux-specific operations
+    SETLEASE = 0x400,
+    GETLEASE = 0x400 + 1,
     NOTIFY = 0x400 + 2,
     DUPFD_CLOEXEC = 0x400 + 6,
     SETPIPE_SZ = 0x400 + 7,
@@ -176,6 +247,17 @@ struct WordSize32Defs {
   } ElfEhdr;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Ehdr, ElfEhdr);
   typedef struct {
+    uint32_t p_type;
+    uint32_t p_offset;
+    uint32_t p_vaddr;
+    uint32_t p_paddr;
+    uint32_t p_filesz;
+    uint32_t p_memsz;
+    uint32_t p_flags;
+    uint32_t p_align;
+  } ElfPhdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Phdr, ElfPhdr);
+  typedef struct {
     uint32_t sh_name;
     uint32_t sh_type;
     uint32_t sh_flags;
@@ -188,6 +270,11 @@ struct WordSize32Defs {
     uint32_t sh_entsize;
   } ElfShdr;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Shdr, ElfShdr);
+  typedef struct {
+    uint32_t ch_type;
+    uint32_t ch_size;
+    uint32_t ch_addralign;
+  } ElfChdr;
   typedef struct {
     uint32_t st_name;
     uint32_t st_value;
@@ -208,6 +295,21 @@ struct WordSize32Defs {
     uint32_t n_type;
   } ElfNhdr;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Nhdr, ElfNhdr);
+  typedef struct {
+    uint32_t r_offset;
+    uint32_t r_info;
+  } ElfRel;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Rel, ElfRel);
+  typedef struct {
+    uint32_t r_offset;
+    uint32_t r_info;
+    int32_t r_addend;
+  } ElfRela;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Rela, ElfRela);
+
+  static uint8_t clz_ptr(remote_ptr<void> ptr) {
+    return __builtin_clz(ptr.as_int());
+  }
 };
 
 struct WordSize64Defs {
@@ -255,6 +357,17 @@ struct WordSize64Defs {
   } ElfEhdr;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Ehdr, ElfEhdr);
   typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+  } ElfPhdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Phdr, ElfPhdr);
+  typedef struct {
     uint32_t sh_name;
     uint32_t sh_type;
     uint64_t sh_flags;
@@ -267,6 +380,12 @@ struct WordSize64Defs {
     uint64_t sh_entsize;
   } ElfShdr;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Shdr, ElfShdr);
+  typedef struct {
+    uint32_t ch_type;
+    uint32_t ch_reserved;
+    uint64_t ch_size;
+    uint64_t ch_addralign;
+  } ElfChdr;
   typedef struct {
     uint32_t st_name;
     uint8_t st_info;
@@ -287,6 +406,21 @@ struct WordSize64Defs {
     uint32_t n_type;
   } ElfNhdr;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Nhdr, ElfNhdr);
+  typedef struct {
+    uint64_t r_offset;
+    uint64_t r_info;
+  } ElfRel;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Rel, ElfRel);
+  typedef struct {
+    uint64_t r_offset;
+    uint64_t r_info;
+    int64_t r_addend;
+  } ElfRela;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Rela, ElfRela);
+
+  static uint8_t clz_ptr(remote_ptr<void> ptr) {
+    return __builtin_clzl(ptr.as_int());
+  }
 };
 
 /**
@@ -348,21 +482,6 @@ struct BaseArch : public wordsize,
   typedef uint32_t __u32;
   typedef uint64_t __u64;
   typedef __u64 aligned_u64 __attribute((aligned(8)));
-
-  // These are the same across all architectures. The kernel defines them for
-  // all architectures in the uapi headers, but the libc's headers may not.
-  // Further, the libc headers may conflict with the kernel headers, so for
-  // simplicitly, we just define everything here:
-  static const int PTRACE_TRACEME = 0;
-  static const int PTRACE_PEEKTEXT = 1;
-  static const int PTRACE_PEEKDATA = 2;
-  static const int PTRACE_PEEKUSR = 3;
-  static const int PTRACE_POKETEXT = 4;
-  static const int PTRACE_POKEDATA = 5;
-  static const int PTRACE_POKEUSR = 6;
-  static const int PTRACE_CONT = 7;
-  static const int PTRACE_KILL = 8;
-  static const int PTRACE_SINGLESTEP = 9;
 
   // If they are defined in the header, undef them now.
   // In rr, we always refer to them as these constants.
@@ -587,6 +706,13 @@ struct BaseArch : public wordsize,
       struct {
         ptr<void> si_addr_;
         signed_short si_addr_lsb_;
+        union {
+          struct {
+            ptr<void> _lower;
+            ptr<void> _upper;
+          } _addr_bnds;
+          uint32_t _pkey;
+        } _bounds;
       } _sigfault;
       struct {
         signed_long si_band_;
@@ -611,12 +737,12 @@ struct BaseArch : public wordsize,
     tcflag_t c_cflag;
     tcflag_t c_lflag;
     cc_t c_line;
-    cc_t c_cc[32];
-    char _padding[3];
-    speed_t c_ispeed;
-    speed_t c_ospeed;
+    cc_t c_cc[19];
   };
-  RR_VERIFY_TYPE(termios);
+  /* We don't verify termios because the kernel and glibc don't agree on its
+   * layout and ensuring that we only have the kernel termios visible here is
+   * a pain.
+   */
 
   struct termio {
     unsigned_short c_iflag;
@@ -626,7 +752,6 @@ struct BaseArch : public wordsize,
     unsigned char c_line;
     unsigned char c_cc[8];
   };
-  RR_VERIFY_TYPE(termio);
 
   struct seccomp_notif_sizes {
     uint16_t seccomp_notif;
@@ -657,6 +782,22 @@ struct BaseArch : public wordsize,
     unsigned_long iomap_base;
   };
   RR_VERIFY_TYPE(serial_struct);
+
+  struct serial_icounter_struct {
+    int cts;
+    int dsr;
+    int rng;
+    int dcd;
+    int rx;
+    int tx;
+    int frame;
+    int overrun;
+    int parity;
+    int brk;
+    int buf_overrun;
+    int reserved[9];
+  };
+  RR_VERIFY_TYPE(serial_icounter_struct);
 
   struct winsize {
     unsigned_short ws_row;
@@ -965,7 +1106,8 @@ struct BaseArch : public wordsize,
     off_t l_len;
     pid_t l_pid;
   };
-  RR_VERIFY_TYPE_EXPLICIT(struct ::flock, _flock);
+  // Doesn't verify on x86-32 where our system off_t is 64 bits because
+  // we need to access large files.
 
   struct flock64 {
     signed_short l_type;
@@ -1155,17 +1297,11 @@ struct BaseArch : public wordsize,
   };
   RR_VERIFY_TYPE(__sysctl_args);
 
+  // libc reserves some space in the user facing structures for future
+  // extensibility, so we are careful to use the kernel definition here.
   typedef struct {
     unsigned_long __val[64 / (8 * sizeof(unsigned_long))];
   } kernel_sigset_t;
-
-  // libc reserves some space in the user facing structures for future
-  // extensibility.
-  typedef struct {
-    unsigned_long __val[1024 / (8 * sizeof(unsigned_long))];
-  } __sigset_t;
-  typedef __sigset_t sigset_t;
-  RR_VERIFY_TYPE(sigset_t);
 
   typedef struct {
     ptr<const kernel_sigset_t> ss;
@@ -1190,7 +1326,8 @@ struct BaseArch : public wordsize,
     rlim_t rlim_cur;
     rlim_t rlim_max;
   };
-  RR_VERIFY_TYPE(rlimit);
+  // Doesn't verify on x86-32 where our system off_t is 64 bits because
+  // we need to access large files.
 
   struct rlimit64 {
     rlim64_t rlim_cur;
@@ -1204,7 +1341,7 @@ struct BaseArch : public wordsize,
   };
   RR_VERIFY_TYPE_EXPLICIT(struct ::timezone, timezone);
 
-  struct statfs {
+  struct statfs_t {
     __statfs_word f_type;
     __statfs_word f_bsize;
     __statfs_word f_blocks;
@@ -1220,9 +1357,11 @@ struct BaseArch : public wordsize,
     __statfs_word f_flags;
     __statfs_word f_spare[4];
   };
-  RR_VERIFY_TYPE_EXPLICIT(struct ::statfs, statfs);
+  // Doesn't verify on x86-32 where our system __fsblkcnt_t is 64 bits because
+  // we need to access large files.
 
-  struct statfs64 {
+  /* Don't align for the 64-bit values on 32-bit x86 */
+  struct __attribute__((packed)) statfs64_t {
     __statfs_word f_type;
     __statfs_word f_bsize;
     uint64_t f_blocks;
@@ -1238,7 +1377,7 @@ struct BaseArch : public wordsize,
     __statfs_word f_flags;
     __statfs_word f_spare[4];
   };
-  RR_VERIFY_TYPE_EXPLICIT(struct ::statfs64, statfs64);
+  RR_VERIFY_TYPE_EXPLICIT(struct ::statfs64, statfs64_t);
 
   struct itimerval {
     timeval it_interval;
@@ -1260,7 +1399,7 @@ struct BaseArch : public wordsize,
   } stack_t;
   RR_VERIFY_TYPE(stack_t);
 
-  struct sysinfo {
+  struct sysinfo_t {
     __kernel_long_t uptime;
     __kernel_ulong_t loads[3];
     __kernel_ulong_t totalram;
@@ -1277,7 +1416,7 @@ struct BaseArch : public wordsize,
     uint32_t mem_unit;
     char _f[20 - 2 * sizeof(__kernel_ulong_t) - sizeof(uint32_t)];
   };
-  RR_VERIFY_TYPE_EXPLICIT(struct ::sysinfo, sysinfo);
+  RR_VERIFY_TYPE_EXPLICIT(struct ::sysinfo, sysinfo_t);
 
   static const ::size_t UTSNAME_LENGTH = 65;
   struct utsname {
@@ -1432,7 +1571,8 @@ struct BaseArch : public wordsize,
     //    uint8_t d_type;
     uint8_t d_name[256];
   };
-  RR_VERIFY_TYPE(dirent);
+  // Doesn't verify on x86-32 where our system dirent uses 64-bit ino/off because
+  // we need to access large files.
 
   struct dirent64 {
     ino64_t d_ino;
@@ -1471,6 +1611,21 @@ struct BaseArch : public wordsize,
   // The corresponding header requires -fpermissive, which we don't pass. Skip
   // this check.
   // RR_VERIFY_TYPE(ipt_replace);
+
+  struct ip6t_replace {
+    uint8_t name[32];
+    uint32_t valid_hook;
+    uint32_t num_entries;
+    uint32_t size;
+    uint32_t hook_entry[5];
+    uint32_t underflow[5];
+    uint32_t num_counters;
+    ptr<xt_counters> counters; // ptr<xt_counters>
+    // Plus hangoff here
+  };
+  // The corresponding header requires -fpermissive, which we don't pass. Skip
+  // this check.
+  // RR_VERIFY_TYPE(ip6t_replace);
 
   struct cap_header {
     uint32_t version;
@@ -1530,6 +1685,21 @@ struct BaseArch : public wordsize,
 
     struct hci_dev_stats stat;
   };
+
+  struct rseq_t {
+    uint32_t cpu_id_start;
+    uint32_t cpu_id;
+    uint64_t rseq_cs;
+    uint32_t flags;
+  } __attribute__((aligned(32)));
+
+  struct rseq_cs {
+    uint32_t version;
+    uint32_t flags;
+    uint64_t start_ip;
+    uint64_t post_commit_offset;
+    uint64_t abort_ip;
+  } __attribute__((aligned(32)));
 
   typedef struct ifbond {
     int32_t bond_mode;
@@ -1607,7 +1777,7 @@ struct BaseArch : public wordsize,
     uint64_t __spare2[14];
   } statx;
   // statx not yet widely available in system headers
-  // RR_VERIFY_TYPE(statx);
+  // RR_VERIFY_TYPE_EXPLICIT(struct ::statx, statx);
 
   struct sg_io_hdr {
     int interface_id;
@@ -1659,7 +1829,7 @@ struct BaseArch : public wordsize,
       };
       __u64 flags;
     };
-    struct {
+    struct { /* used by BPF_PROG_LOAD */
       __u32 prog_type;
       __u32 insn_cnt;
       ptr64<void> insns;
@@ -1680,6 +1850,34 @@ struct BaseArch : public wordsize,
       aligned_u64 line_info;
       __u32 line_info_cnt;
     };
+
+    struct { /* anonymous struct used by BPF_PROG_QUERY command */
+      union {
+        __u32 target_fd; /* target object to query or ... */
+        __u32 target_ifindex; /* target ifindex */
+      };
+      __u32 attach_type;
+      __u32 query_flags;
+      __u32 attach_flags;
+      ptr64<__u32> prog_ids;
+      union {
+        __u32 prog_cnt;
+        __u32 count;
+      };
+      __u32 :32;
+      /* output: per-program attach_flags.
+       * not allowed to be set during effective query.
+       */
+      ptr64<__u32> prog_attach_flags;
+      ptr64<__u32> link_ids;
+      ptr64<__u32> link_attach_flags;
+      __u64 revision;
+    } query;
+    struct { /* anonymous struct used by RR_BPF_OBJ_GET_INFO_BY_FD command */
+      __u32 bpf_fd;
+      __u32 info_len;
+      __u64 info;
+    } info;
   };
 
   struct file_handle {
@@ -1831,10 +2029,52 @@ struct BaseArch : public wordsize,
     uint8_t cdte_datamode;
   };
   RR_VERIFY_TYPE(cdrom_tocentry);
+
+  struct mtd_read_req_ecc_stats {
+    uint32_t uncorrectable_errors;
+    uint32_t corrected_bitflips;
+    uint32_t max_bitflips;
+  };
+
+  struct mtd_read_req {
+    uint64_t start;
+    uint64_t len;
+    uint64_t ooblen;
+    uint64_t usr_data;
+    uint64_t usr_oob;
+    uint8_t mode;
+    uint8_t padding[7];
+    struct mtd_read_req_ecc_stats ecc_stats;
+  };
+  // mtd_read_req was only added in kernel 6.1 so don't try to verify it yet.
+
+  struct ptrace_syscall_info {
+    uint8_t op;
+    uint32_t arch;
+    uint64_t instruction_pointer;
+    uint64_t stack_pointer;
+    union {
+        struct {
+            uint64_t nr;
+            uint64_t args[6];
+        } entry;
+        struct {
+            int64_t rval;
+            uint8_t is_error;
+        } exit;
+        struct {
+            uint64_t nr;
+            uint64_t args[6];
+            uint32_t ret_data;
+        } seccomp;
+    };
+  };
 };
 
 struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   typedef X64Arch Arch64;
+
+  static const uint8_t default_virtual_address_size = 47;
 
   static const size_t elfmachine = EM::X86_64;
   static const size_t elfendian = ELFENDIAN::DATA2LSB;
@@ -1899,8 +2139,8 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     uint64_t fs;
     uint64_t gs;
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user_regs_struct,
-                      user_regs_struct);
+  RR_VERIFY_TYPE_X86_ARCH(SupportedArch::x86_64, ::user_regs_struct,
+                          user_regs_struct);
 
   struct sigcontext {
     uint64_t r8;
@@ -1972,10 +2212,13 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     uint64_t magic;
     char u_comm[32];
     uint64_t u_debugreg[8];
+    uint64_t error_code;
+    uint64_t fault_address;
   };
-  RR_VERIFY_TYPE_X86_ARCH(SupportedArch::x86_64, ::user, user);
+  // Can't verify this one because glibc leaves out the last two members and the
+  // kernel header isn't available to userspace.
 
-  struct stat {
+  struct stat_t {
     dev_t st_dev;
     ino_t st_ino;
     nlink_t st_nlink;
@@ -1992,10 +2235,10 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     struct timespec st_ctim;
     syscall_slong_t __rr_unused[3];
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat, struct stat);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat, struct stat_t);
 
-  struct stat64 : public stat {};
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat64, struct stat64);
+  struct stat64_t : public stat_t {};
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat64, struct stat64_t);
 
   struct semid64_ds {
     ipc64_perm sem_perm;
@@ -2032,10 +2275,17 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     uint32_t rule_locs[0];
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::ethtool_rxnfc, struct ethtool_rxnfc);
+
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::flock, _flock);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::rlimit, rlimit);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::statfs, statfs_t);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::dirent, dirent);
 };
 
 struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
   typedef X64Arch Arch64;
+
+  static const uint8_t default_virtual_address_size = 32;
 
   static const size_t elfmachine = EM::I386;
   static const size_t elfendian = ELFENDIAN::DATA2LSB;
@@ -2173,7 +2423,7 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
   };
   RR_VERIFY_TYPE_X86_ARCH(SupportedArch::x86, ::user, user);
 
-  struct stat {
+  struct stat_t {
     dev_t st_dev;
     unsigned_short __pad1;
     ino_t st_ino;
@@ -2192,9 +2442,10 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
     unsigned_long __unused4;
     unsigned_long __unused5;
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::stat, struct stat);
+  // Doesn't verify on x86-32 where various fields are 64 bits because
+  // we need to access large files/filesystems.
 
-  struct __attribute__((packed)) stat64 {
+  struct __attribute__((packed)) stat64_t {
     dev_t st_dev;
     unsigned_int __pad1;
     ino_t __st_ino;
@@ -2212,7 +2463,7 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
     timespec st_ctim;
     ino64_t st_ino;
   };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::stat64, struct stat64);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86, struct ::stat64, struct stat64_t);
 
   struct semid64_ds {
     ipc64_perm sem_perm;
@@ -2259,23 +2510,24 @@ struct GenericArch : public BaseArch<arch_, wordsize> {
   typedef uint32_t legacy_uid_t;
   typedef uint32_t legacy_gid_t;
 
-  struct stat {
-    dev_t st_dev;
-    ino_t st_ino;
-    mode_t st_mode;
-    nlink_t st_nlink;
-    uid_t st_uid;
-    gid_t st_gid;
-    dev_t st_rdev;
-    unsigned long __pad1;
-    off_t st_size;
-    blksize_t st_blksize;
-    int __pad2;
-    blkcnt_t st_blocks;
-    struct timespec st_atim;
-    struct timespec st_mtim;
-    struct timespec st_ctim;
-    int __rr_unused[2];
+  // See kernel include/uapi/asm-generic/stat.h
+  struct stat_t {
+    typename BaseArch<arch_, wordsize>::unsigned_long st_dev;
+    typename BaseArch<arch_, wordsize>::unsigned_long st_ino;
+    typename BaseArch<arch_, wordsize>::unsigned_int st_mode;
+    typename BaseArch<arch_, wordsize>::unsigned_int st_nlink;
+    typename BaseArch<arch_, wordsize>::unsigned_int st_uid;
+    typename BaseArch<arch_, wordsize>::unsigned_int st_gid;
+    typename BaseArch<arch_, wordsize>::unsigned_long st_rdev;
+    typename BaseArch<arch_, wordsize>::unsigned_long __pad1;
+    typename BaseArch<arch_, wordsize>::signed_long st_size;
+    typename BaseArch<arch_, wordsize>::signed_int st_blksize;
+    typename BaseArch<arch_, wordsize>::signed_int __pad2;
+    typename BaseArch<arch_, wordsize>::signed_long st_blocks;
+    typename BaseArch<arch_, wordsize>::timespec st_atim;
+    typename BaseArch<arch_, wordsize>::timespec st_mtim;
+    typename BaseArch<arch_, wordsize>::timespec st_ctim;
+    typename BaseArch<arch_, wordsize>::unsigned_int __rr_unused[2];
   };
 
   struct semid64_ds {
@@ -2287,11 +2539,13 @@ struct GenericArch : public BaseArch<arch_, wordsize> {
     typename BaseArch<arch_, wordsize>::unsigned_long __unused4;
   };
 
-  struct stat64 : public stat {};
+  struct stat64_t : public stat_t {};
 };
 
 struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
   typedef ARM64Arch Arch64;
+
+  static const uint8_t default_virtual_address_size = 47;
 
   static const size_t elfmachine = EM::AARCH64;
   static const size_t elfendian = ELFENDIAN::DATA2LSB;
@@ -2351,18 +2605,22 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
     struct hw_bp dbg_regs[16];
   };
 
-  struct sigcontext {
+  // Also defined as mcontext_t in some headers
+  struct __attribute((aligned(16))) sigcontext {
     __u64 fault_addr;
     user_pt_regs regs;
     // ISA extension state follows here
+    unsigned char __reserved[4096] __attribute((aligned(16)));
   };
 
+  // Also defined as ucontext_t in some headers
   struct ucontext {
     unsigned long	uc_flags;
     ptr<ucontext> uc_link;
     stack_t		  uc_stack;
-    sigset_t	  uc_sigmask;
-    uint8_t __unused[1024 / 8 - sizeof(sigset_t)];
+    kernel_sigset_t	  uc_sigmask;
+    /* 128 bytes are reserved for the sigmask so reflect that here */
+    uint8_t __unused1[1024 / 8 - sizeof(kernel_sigset_t)];
     struct sigcontext uc_mcontext;
   };
 
@@ -2371,6 +2629,7 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
     struct ucontext uc;
   };
 
+  RR_VERIFY_TYPE_ARCH(SupportedArch::aarch64, struct ::stat, struct stat_t);
   RR_VERIFY_TYPE_ARCH(SupportedArch::aarch64, struct ::semid64_ds, struct semid64_ds);
 
   struct ethtool_rx_flow_spec {
@@ -2396,6 +2655,22 @@ struct ARM64Arch : public GenericArch<SupportedArch::aarch64, WordSize64Defs> {
     uint32_t rule_locs[0];
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::aarch64, struct ::ethtool_rxnfc, struct ethtool_rxnfc);
+
+  RR_VERIFY_TYPE_ARCH(SupportedArch::aarch64, struct ::flock, _flock);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::aarch64, struct ::rlimit, rlimit);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::statfs, statfs_t);
+  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::dirent, dirent);
+
+  struct user_pac_address_keys {
+    __uint128_t apiakey;
+    __uint128_t apibkey;
+    __uint128_t	apdakey;
+    __uint128_t apdbkey;
+  };
+
+  struct user_pac_generic_keys {
+    __uint128_t apgakey;
+  };
 };
 
 #define RR_ARCH_FUNCTION(f, arch, args...)                                     \
@@ -2464,6 +2739,13 @@ size_t sigaction_sigset_size(SupportedArch arch);
 
 size_t user_regs_struct_size(SupportedArch arch);
 size_t user_fpregs_struct_size(SupportedArch arch);
+
+/* Returns the number of bits necessary for this particular virtual address. */
+uint8_t virtual_address_size(SupportedArch arch, remote_ptr<void> ptr);
+/* Returns the number of bits supported by default on this architecture for
+ * *userspace* virtual addresses.
+ */
+uint8_t default_virtual_address_size(SupportedArch arch);
 
 #if defined(__i386__)
 typedef X86Arch NativeArch;

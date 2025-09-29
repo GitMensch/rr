@@ -17,7 +17,6 @@
 namespace rr {
 
 class Session;
-class ThreadDb;
 
 /**
  * Tracks a group of tasks with an associated ID, set from the
@@ -27,7 +26,7 @@ class ThreadDb;
  * of the thread grouping during record. During replay, we put each task
  * into its own thread group.
  */
-class ThreadGroup : public HasTaskSet {
+class ThreadGroup final : public HasTaskSet {
 public:
   ThreadGroup(Session* session, ThreadGroup* parent,
               pid_t tgid, pid_t thid_own_namespace,

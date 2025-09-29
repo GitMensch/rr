@@ -3,6 +3,7 @@
 #ifndef RR_RECORD_TASK_H_
 #define RR_RECORD_TASK_H_
 
+#include "ContextSwitchEvent.h"
 #include "Registers.h"
 #include "Task.h"
 #include "TraceFrame.h"
@@ -10,6 +11,10 @@
 namespace rr {
 
 struct Sighandlers;
+class TaskSyscallStateBase {
+public:
+  virtual ~TaskSyscallStateBase() {}
+};
 
 /** Different kinds of waits a task can do.
  */
@@ -32,6 +37,9 @@ enum EmulatedStopType {
   NOT_STOPPED,
   GROUP_STOP,          // stopped by a signal. This applies to non-ptracees too.
   SIGNAL_DELIVERY_STOP,// Stopped before delivering a signal. ptracees only.
+  SYSCALL_ENTRY_STOP,  // Stopped at syscall entry. ptracees only
+  SYSCALL_EXIT_STOP,   // Stopped at syscall exit. ptracees only
+  SECCOMP_STOP,        // Stopped at seccomp stop. ptracees only
   CHILD_STOP           // All other kinds of non-ptrace stops
 };
 
@@ -46,6 +54,7 @@ struct SyscallbufCodeLayout {
   remote_code_ptr syscallbuf_code_end;
   remote_code_ptr get_pc_thunks_start;
   remote_code_ptr get_pc_thunks_end;
+  remote_code_ptr syscallbuf_syscall_hook;
   remote_code_ptr syscallbuf_final_exit_instruction;
 };
 
@@ -55,7 +64,7 @@ enum SignalDisposition { SIGNAL_DEFAULT, SIGNAL_IGNORE, SIGNAL_HANDLER };
  * Every Task owned by a RecordSession is a RecordTask. Functionality that
  * only applies during recording belongs here.
  */
-class RecordTask : public Task {
+class RecordTask final : public Task {
 public:
   RecordTask(RecordSession& session, pid_t _tid, uint32_t serial,
              SupportedArch a);
@@ -73,9 +82,12 @@ public:
                                      int /*sig*/) override;
   virtual void did_wait() override;
 
+  bool enable_chaos_memory_allocations() const;
+
   std::vector<remote_code_ptr> syscallbuf_syscall_entry_breakpoints();
   bool is_at_syscallbuf_syscall_entry_breakpoint();
   bool is_at_syscallbuf_final_instruction_breakpoint();
+  bool is_at_syscallstub_exit_breakpoint();
 
   /**
    * Initialize tracee buffers in this, i.e., implement
@@ -107,15 +119,23 @@ public:
    * Returns true if the task is stopped-for-emulated-ptrace, false otherwise.
    */
   bool emulate_ptrace_stop(WaitStatus status,
+                           const siginfo_t* siginfo = nullptr, int si_code = 0) {
+    return emulate_ptrace_stop(status, status.group_stop() ? GROUP_STOP : SIGNAL_DELIVERY_STOP,
+      siginfo, si_code);
+  }
+  bool emulate_ptrace_stop(WaitStatus status, EmulatedStopType stop_type,
                            const siginfo_t* siginfo = nullptr, int si_code = 0);
+
   /**
    * Force the ptrace-stop state no matter what state the task is currently in.
    */
-  void force_emulate_ptrace_stop(WaitStatus status);
+  void force_emulate_ptrace_stop(WaitStatus status, EmulatedStopType stop_type);
   /**
    * If necessary, signal the ptracer that this task has exited.
    */
   void do_ptrace_exit_stop(WaitStatus exit_status);
+
+  void record_exit_trace_event(WaitStatus exit_status);
   /**
    * Return the exit event.
    * If write_child_tid is set, zero out child_tid now if applicable.
@@ -124,7 +144,7 @@ public:
     KERNEL_WRITES_CHILD_TID,
     WRITE_CHILD_TID,
   };
-  void record_exit_event(int exitsig = 0, WriteChildTid write_child_tid = KERNEL_WRITES_CHILD_TID);
+  void record_exit_event(WriteChildTid write_child_tid = KERNEL_WRITES_CHILD_TID);
   /**
    * Called when we're about to deliver a signal to this task. If it's a
    * synthetic SIGCHLD and there's a ptraced task that needs to SIGCHLD,
@@ -132,9 +152,8 @@ public:
    * ptraced task has had its SIGCHLD sent.
    * Note that we can't set the correct siginfo when we send the signal, because
    * it requires us to set information only the kernel has permission to set.
-   * Returns false if this signal should be deferred.
    */
-  bool set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
+  void set_siginfo_for_synthetic_SIGCHLD(siginfo_t* si);
   /**
    * Sets up |si| as if we're delivering a SIGCHLD/waitid for this waited task.
    */
@@ -169,8 +188,12 @@ public:
    */
   bool is_waiting_for(RecordTask* t);
 
-  virtual bool already_exited() const override {
-    return waiting_for_reap || waiting_for_zombie;
+  bool already_exited() const override {
+    return waiting_for_reap;
+  }
+
+  bool is_detached_proxy() const override {
+    return detached_proxy;
   }
 
   /**
@@ -224,6 +247,10 @@ public:
    */
   bool is_sig_ignored(int sig) const;
   /**
+   * Return true iff |sig| is a stopping signal.
+   */
+  bool is_sig_stopping(int sig) const;
+  /**
    * Return the applications current disposition of |sig|.
    */
   SignalDisposition sig_disposition(int sig) const;
@@ -273,14 +300,16 @@ public:
   void stash_synthetic_sig(const siginfo_t& si,
                            SignalDeterministic deterministic);
   bool has_stashed_sig() const { return !stashed_signals.empty(); }
-  const siginfo_t* stashed_sig_not_synthetic_SIGCHLD() const;
-  bool has_stashed_sig(int sig) const;
   struct StashedSignal {
-    StashedSignal(const siginfo_t& siginfo, SignalDeterministic deterministic)
-        : siginfo(siginfo), deterministic(deterministic) {}
+    StashedSignal(const siginfo_t& siginfo, SignalDeterministic deterministic,
+                  remote_code_ptr ip)
+        : siginfo(siginfo), deterministic(deterministic), ip(ip) {}
     siginfo_t siginfo;
     SignalDeterministic deterministic;
+    remote_code_ptr ip;
   };
+  const StashedSignal* stashed_sig_not_synthetic_SIGCHLD() const;
+  bool has_stashed_sig(int sig) const;
   const StashedSignal* peek_stashed_sig_to_deliver() const;
   void pop_stash_sig(const StashedSignal* stashed);
   void stashed_signal_processed();
@@ -312,7 +341,7 @@ public:
   bool at_may_restart_syscall() const;
   /**
    * Return true iff this is at an execution state where
-   * a syscall that modifes isgnals was interrupted but will not
+   * a syscall that modifies signals was interrupted but will not
    * be automatically restarted.
    **/
   bool at_interrupted_non_restartable_signal_modifying_syscall() const;
@@ -341,6 +370,10 @@ public:
   /**
    * Return true if this is within the syscallbuf library.  This
    * *does not* imply that $ip is at a buffered syscall.
+   * This also includes the runtime stub code that runs
+   * before entering syscallbuf but does not include the "safe area".
+   * Returning true from this function implies that the code will execute
+   * `_syscallbuf_final_exit_instruction` before returning to normal code.
    */
   bool is_in_syscallbuf();
   /**
@@ -373,7 +406,8 @@ public:
   void record_local(remote_ptr<T> addr, const T* buf, size_t count = 1) {
     record_local(addr, sizeof(T) * count, buf);
   }
-  void record_remote(remote_ptr<void> addr, ssize_t num_bytes);
+  void record_remote(remote_ptr<void> addr, ssize_t num_bytes,
+                     MemWriteSizeValidation size_validation = MemWriteSizeValidation::EXACT);
   template <typename T> void record_remote(remote_ptr<T> addr) {
     record_remote(addr, sizeof(T));
   }
@@ -388,12 +422,21 @@ public:
   ssize_t record_remote_fallible(remote_ptr<void> addr, uintptr_t num_bytes,
                                  const std::vector<WriteHole>& holes = std::vector<WriteHole>());
   // Record as much as we can of the bytes in this range. Will record only
-  // contiguous mapped-writable data starting at `addr`.
-  void record_remote_writable(remote_ptr<void> addr, ssize_t num_bytes);
+  // contiguous mapped-writable data starting at `addr`. rr mappings (e.g. syscallbuf)
+  // are treated as non-contiguous with any other mapping.
+  void record_remote_writable(remote_ptr<void> addr, ssize_t num_bytes,
+                              MemWriteSizeValidation size_validation = MemWriteSizeValidation::EXACT);
 
   // Simple helper that attempts to use the local mapping to record if one
   // exists
   bool record_remote_by_local_map(remote_ptr<void> addr, size_t num_bytes);
+
+  template <typename T>
+  void write_and_record(remote_ptr<T> addr, const T& value, bool* ok = nullptr,
+                        uint32_t flags = 0) {
+    write_mem(addr, value, ok, flags);
+    record_local(addr, &value, 1);
+  }
 
   /**
    * Save tracee data to the trace.  |addr| is the address in
@@ -477,29 +520,17 @@ public:
      */
     DONT_RESET_SYSCALLBUF
   };
-  void record_event(const Event& ev, FlushSyscallbuf flush = FLUSH_SYSCALLBUF,
+  // Take `ev` by value to avoid bugs where we pass in an event in
+  // `pending_events`, which could lead to dangling references when
+  // flushing the syscallbuf manipulates `pending_events`.
+  void record_event(Event ev, FlushSyscallbuf flush = FLUSH_SYSCALLBUF,
                     AllowSyscallbufReset reset = ALLOW_RESET_SYSCALLBUF,
                     const Registers* registers = nullptr);
 
   bool is_fatal_signal(int sig, SignalDeterministic deterministic) const;
 
   /**
-   * Return the pid of the newborn thread created by this task.
-   * Called when this task has a PTRACE_CLONE_EVENT with CLONE_THREAD.
-   */
-  pid_t find_newborn_thread();
-  /**
-   * Return the pid of the newborn process (whose parent has pid `parent_pid`,
-   * which need not be the same as the current task's pid, due to CLONE_PARENT)
-   * created by this task. Called when this task has a PTRACE_CLONE_EVENT
-   * without CLONE_THREAD, or PTRACE_FORK_EVENT.
-   */
-  pid_t find_newborn_process(pid_t child_parent);
-
-  /**
-   * If the process looks alive, kill it. It is recommended to call try_wait(),
-   * on this task before, to make sure liveness is correctly reflected when
-   * making this decision
+   * If the process looks alive, kill it.
    */
   void kill_if_alive();
 
@@ -563,7 +594,7 @@ public:
   bool is_container_init() const { return tg->tgid_own_namespace == 1; }
 
   /**
-   * Linux requires the invariant that that all members of a thread group
+   * Linux requires the invariant that all members of a thread group
    * are reaped before the thread group leader. This determines whether or
    * not we're allowed to attempt reaping this thread or whether doing so
    * risks deadlock.
@@ -576,12 +607,6 @@ public:
    */
   void reap();
 
-  /**
-   * Return true if the status of this has changed, but don't
-   * block.
-   */
-  bool try_wait();
-
   bool waiting_for_pid_namespace_tasks_to_exit() const;
   int process_depth() const;
 
@@ -593,6 +618,23 @@ public:
    * May queue signals for specific tasks.
    */
   void send_synthetic_SIGCHLD_if_necessary();
+
+  void set_sigmask(sig_set_t mask);
+
+  /**
+   * Update the futex robust list head pointer to |list| (which
+   * is of size |len|).
+   */
+  void set_robust_list(remote_ptr<void> list, size_t len) {
+    robust_futex_list = list;
+    robust_futex_list_len = len;
+  }
+
+  void set_stopped(bool stopped) override;
+
+  // Tries to extend an adjacent `MAP_GROWSDOWN` mapping to include the
+  // given address. Returns false if nothing was done.
+  bool try_grow_map(remote_ptr<void> addr);
 
 private:
   /* Retrieve the tid of this task from the tracee and store it */
@@ -612,14 +654,6 @@ private:
    * Call this when SYS_sigaction is finishing with |regs|.
    */
   void update_sigaction(const Registers& regs);
-  /**
-   * Update the futex robust list head pointer to |list| (which
-   * is of size |len|).
-   */
-  void set_robust_list(remote_ptr<void> list, size_t len) {
-    robust_futex_list = list;
-    robust_futex_list_len = len;
-  }
 
   template <typename Arch> void init_buffers_arch();
   template <typename Arch>
@@ -633,6 +667,8 @@ private:
   virtual bool post_vm_clone(CloneReason reason, int flags, Task* origin) override;
 
 public:
+  uint64_t scheduler_token;
+  std::unique_ptr<TaskSyscallStateBase> syscall_state;
   Ticks ticks_at_last_recorded_syscall_exit;
   remote_code_ptr ip_at_last_recorded_syscall_exit;
 
@@ -682,6 +718,7 @@ public:
   // tracer attached via PTRACE_SEIZE
   bool emulated_ptrace_seized;
   WaitType in_wait_type;
+  int in_wait_options;
   pid_t in_wait_pid;
 
   // Signal handler state
@@ -709,7 +746,7 @@ public:
   // Syscallbuf state
 
   SyscallbufCodeLayout syscallbuf_code_layout;
-  ScopedFd desched_fd;
+  ContextSwitchEvent desched_fd;
   /* Value of hdr->num_rec_bytes when the buffer was flushed */
   uint32_t flushed_num_rec_bytes;
   /* Nonzero after the trace recorder has flushed the
@@ -749,18 +786,20 @@ public:
   // Our value for ARCH_GET/SET_CPUID (0 -> generate SIGSEGV, 1 -> do CPUID).
   // Only used if session().has_cpuid_faulting().
   int cpuid_mode;
-  // The current stack of events being processed.  (We use a
-  // deque instead of a stack because we need to iterate the
-  // events.)
-  std::deque<Event> pending_events;
+  // The current stack of events being processed.
+  std::vector<Event> pending_events;
   // Stashed signal-delivery state, ready to be delivered at
   // next opportunity.
   std::deque<StashedSignal> stashed_signals;
+  // When true, we're blocking signals during a syscall to
+  // prevent new signals from being delivered. `blocked_sigs_dirty`
+  // is false and `blocked_sigs` contains the previous sigmask.
   bool stashed_signals_blocking_more_signals;
   bool stashed_group_stop;
   bool break_at_syscallbuf_traced_syscalls;
   bool break_at_syscallbuf_untraced_syscalls;
   bool break_at_syscallbuf_final_instruction;
+  remote_code_ptr syscallstub_exit_breakpoint;
 
   // The pmc is programmed to interrupt at a value requested by the tracee, not
   // by rr.
@@ -771,22 +810,23 @@ public:
   // This task is just waiting to be reaped.
   bool waiting_for_reap;
 
-  // This task is waiting to reach zombie state
-  bool waiting_for_zombie;
-
   // This task is waiting for a ptrace exit event. It should not
   // be manually run.
   bool waiting_for_ptrace_exit;
 
-  // When exiting a syscall, we should call MonkeyPatcher::try_patch_syscall again.
-  bool retry_syscall_patching;
-
   // We've sent a SIGKILL during shutdown for this task.
   bool sent_shutdown_kill;
+
+  // Last exec system call was an execveat
+  bool did_execveat;
 
   // Set if the tracee requested an override of the ticks request.
   // Used for testing.
   TicksRequest tick_request_override;
+
+  // Set to prevent the scheduler from scheduling this tid, even
+  // if it is otherwise considered runnable. Used for testing.
+  bool schedule_frozen;
 };
 
 } // namespace rr

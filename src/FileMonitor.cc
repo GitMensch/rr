@@ -28,7 +28,7 @@ static bool is_write_syscall_arch(int syscallno) {
          syscallno == Arch::pwrite64 || syscallno == Arch::pwritev;
 }
 
-static bool is_implict_offset_syscall(SupportedArch arch, int syscallno) {
+static bool is_implicit_offset_syscall(SupportedArch arch, int syscallno) {
   RR_ARCH_FUNCTION(is_implicit_offset_syscall_arch, arch, syscallno);
 }
 
@@ -72,7 +72,7 @@ static int64_t retrieve_offset(Task* t, int syscallno, const Registers& regs) {
 
 int64_t FileMonitor::LazyOffset::retrieve(bool needed_for_replay) {
   bool is_replay = t->session().is_replaying();
-  bool is_implicit_offset = is_implict_offset_syscall(t->arch(), syscallno);
+  bool is_implicit_offset = is_implicit_offset_syscall(t->arch(), syscallno);
   ASSERT(t, needed_for_replay || !is_replay);
   // There is no way we can figure out this information now, so retrieve it
   // from the trace (we record it below under the same circumstance).
@@ -89,4 +89,29 @@ int64_t FileMonitor::LazyOffset::retrieve(bool needed_for_replay) {
   }
   return offset;
 }
+
+#define CASE(v) case FileMonitor::v: return #v
+std::string file_monitor_type_name(FileMonitor::Type t) {
+  switch (t) {
+    CASE(Base);
+    CASE(MagicSaveData);
+    CASE(Mmapped);
+    CASE(Preserve);
+    CASE(ProcFd);
+    CASE(ProcMem);
+    CASE(Stdio);
+    CASE(VirtualPerfCounter);
+    CASE(NonvirtualPerfCounter);
+    CASE(SysCpu);
+    CASE(ProcStat);
+    CASE(RRPage);
+    CASE(ODirect);
+    CASE(BpfMap);
+    CASE(PidFd);
+    default:
+      FATAL() << "Unknown type " << (int)t;
+      return "";
+  }
+}
+
 }

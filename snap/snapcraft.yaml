@@ -50,5 +50,9 @@ parts:
       - ninja-build
       - capnproto
       - libcapnp-dev
+      - zlib1g-dev
+      - libzstd-dev
     stage-packages:
       - libcapnp-0.7.0
+      - zlib1g
+      - libzstd1

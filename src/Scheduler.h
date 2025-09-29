@@ -6,7 +6,10 @@
 #include <sched.h>
 
 #include <deque>
+#include <map>
+#include <random>
 #include <set>
+#include <vector>
 
 #include "Ticks.h"
 #include "TraceFrame.h"
@@ -17,6 +20,7 @@ namespace rr {
 
 class RecordSession;
 class RecordTask;
+class WaitAggregator;
 
 /**
  * Overview of rr scheduling:
@@ -102,6 +106,10 @@ public:
    * The new current() task is guaranteed to either have already been
    * runnable, or have been made runnable by a waitpid status change (in
    * which case, result.by_waitpid will be true.
+   * 
+   * After this, if Rescheduled::interrupted_by_signal is false,
+   * and there is a new current task, its is_stopped() must
+   * be true.
    */
   struct Rescheduled {
     bool interrupted_by_signal;
@@ -160,14 +168,16 @@ public:
   bool may_use_unlimited_ticks();
 
   /**
-   * Let the scheduler know that the passed task has started running
+   * Let the scheduler know that the previously stopped task has resumed.
    */
-  void started(RecordTask*) {
-    if (may_use_unlimited_ticks()) {
-      unlimited_ticks_mode = true;
-    }
-    ntasks_running++;
-  }
+  void started_task(RecordTask* t);
+
+  /**
+   * Let the scheduler know that the previously running task has reached a kernel stop
+   * (typically a ptrace stop). Tasks that are blocked but not in a stop
+   * are still "running" for our purposes here.
+   */
+  void stopped_task(RecordTask* t);
 
   /**
    * Let the scheduler know that the task has entered an execve.
@@ -179,9 +189,20 @@ public:
   void did_exit_execve(RecordTask* t);
 
 private:
+  struct CompareByScheduleOrder {
+    bool operator()(RecordTask* a, RecordTask* b) const;
+  };
+  struct SamePriorityTasks {
+    // Tasks ordered in of last-scheduled, most recently scheduled last
+    std::set<RecordTask*, CompareByScheduleOrder> tasks;
+    int consecutive_uses_of_attention_set;
+
+    SamePriorityTasks() : consecutive_uses_of_attention_set(0) {}
+  };
   // Tasks sorted by priority.
-  typedef std::set<std::pair<int, RecordTask*>> TaskPrioritySet;
+  typedef std::map<int, SamePriorityTasks> TaskPrioritySet;
   typedef std::deque<RecordTask*> TaskQueue;
+  typedef std::default_random_engine Random;
 
   /**
    * Pull a task from the round-robin queue if available. Otherwise,
@@ -190,29 +211,37 @@ private:
    * the next runnable task after 't' in round-robin order.
    * Sets 'by_waitpid' to true if we determined the task was runnable by
    * calling waitpid on it and observing a state change. This task *must*
-   * be returned by get_next_thread, and is_runnable_task must not be called
+   * be returned by get_next_thread, and is_task_runnable must not be called
    * on it again until it has run.
    * Considers only tasks with priority <= priority_threshold.
    */
-  RecordTask* find_next_runnable_task(RecordTask* t, bool* by_waitpid,
-                                      int priority_threshold);
+  RecordTask* find_next_runnable_task(WaitAggregator& wait_aggregator,
+                                      std::map<int, std::vector<RecordTask*>>& attention_set_by_priority,
+                                      bool* by_waitpid, int priority_threshold);
   /**
    * Returns the first task in the round-robin queue or null if it's empty,
    * removing it from the round-robin queue.
    */
   RecordTask* get_round_robin_task();
   void maybe_pop_round_robin_task(RecordTask* t);
-  RecordTask* get_next_task_with_same_priority(RecordTask* t);
   void setup_new_timeslice();
   void maybe_reset_priorities(double now);
+  void notify_descheduled(RecordTask* t);
   int choose_random_priority(RecordTask* t);
   void update_task_priority_internal(RecordTask* t, int value);
   void maybe_reset_high_priority_only_intervals(double now);
   bool in_high_priority_only_interval(double now);
   bool treat_as_high_priority(RecordTask* t);
-  bool is_task_runnable(RecordTask* t, bool* by_waitpid);
+  bool is_task_runnable(RecordTask* t, WaitAggregator& wait_aggregator, bool* by_waitpid);
   void validate_scheduled_task();
   void regenerate_affinity_mask();
+
+  void insert_into_task_priority_set(RecordTask* t);
+  void remove_from_task_priority_set(RecordTask* t);
+
+  uint64_t reschedule_count;
+
+  Random random;
 
   RecordSession& session;
 
@@ -226,6 +255,7 @@ private:
    * all tasks in priority order.
    */
   TaskPrioritySet task_priority_set;
+  size_t task_priority_set_total_count;
   TaskQueue task_round_robin_queue;
 
   /**
@@ -262,6 +292,11 @@ private:
   pid_t in_exec_tgid;
 
   /**
+   * The number of tasks that have is_stopped_ set.
+   */
+  int ntasks_stopped;
+
+  /**
    * When true, context switch at every possible point.
    */
   bool always_switch;
@@ -275,7 +310,6 @@ private:
   bool last_reschedule_in_high_priority_only_interval;
 
   bool unlimited_ticks_mode;
-  size_t ntasks_running;
 };
 
 } // namespace rr

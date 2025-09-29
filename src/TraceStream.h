@@ -5,6 +5,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <map>
 #include <memory>
 #include <set>
@@ -25,7 +26,7 @@ namespace rr {
 /**
  * Bump this when rr changes mean that traces produced by new rr can't be replayed by old rr.
  */
-const int FORWARD_COMPATIBILITY_VERSION = 1;
+const int FORWARD_COMPATIBILITY_VERSION = 3;
 
 struct CPUIDRecord;
 struct DisableCPUIDFeatures;
@@ -36,6 +37,16 @@ struct TraceUuid;
 struct WriteHole {
   uint64_t offset;
   uint64_t size;
+};
+
+enum class MemWriteSizeValidation {
+  /* A data record where we _know_ that this data was all written, and it
+   * _must_ be replicated in the replayed process in its entirety */
+  EXACT,
+  /* We recorded a range of memory that's a conservative over-estimate of
+    * what was actually written, and it might not replay cleanly in its
+    * entirety in a replayed process */
+  CONSERVATIVE,
 };
 
 /**
@@ -56,6 +67,7 @@ public:
     size_t size;
     pid_t rec_tid;
     std::vector<WriteHole> holes;
+    MemWriteSizeValidation size_validation;
   };
 
   /**
@@ -77,6 +89,7 @@ public:
   /** Return the directory storing this trace's files. */
   const string& dir() const { return trace_dir; }
 
+  /** Returns -1 if the CPU isn't/wasn't bound. */
   int bound_to_cpu() const { return bind_to_cpu; }
   void set_bound_cpu(int bound) { bind_to_cpu = bound; }
 
@@ -224,13 +237,15 @@ public:
    * 'addr' is the address in the tracee where the data came from/will be
    * restored to.
    */
-  void write_raw(pid_t tid, const void* data, size_t len, remote_ptr<void> addr) {
+  void write_raw(pid_t tid, const void* data, size_t len, remote_ptr<void> addr,
+                 MemWriteSizeValidation size_validation = MemWriteSizeValidation::EXACT) {
     write_raw_data(data, len);
-    write_raw_header(tid, len, addr, std::vector<WriteHole>());
+    write_raw_header(tid, len, addr, std::vector<WriteHole>(), size_validation);
   }
   void write_raw_data(const void* data, size_t len);
   void write_raw_header(pid_t tid, size_t total_len, remote_ptr<void> addr,
-                        const std::vector<WriteHole>& holes);
+                        const std::vector<WriteHole>& holes,
+                        MemWriteSizeValidation size_validation = MemWriteSizeValidation::EXACT);
 
   /**
    * Write a task event (clone or exec record) to the trace.
@@ -243,7 +258,7 @@ public:
   bool good() const;
 
   /**
-   * Create a trace where the tracess are bound to cpu |bind_to_cpu|. This
+   * Create a trace where the traces are bound to cpu |bind_to_cpu|. This
    * data is recorded in the trace. If |bind_to_cpu| is -1 then the tracees
    * were not bound.
    * The trace name is determined by |file_name| and _RR_TRACE_DIR (if set)
@@ -263,6 +278,10 @@ public:
   void set_clear_fip_fdp(bool value) { clear_fip_fdp_ = value; }
   bool clear_fip_fdp() const { return clear_fip_fdp_; }
   void set_chaos_mode(bool value) { chaos_mode = value; }
+  void note_virtual_address_size(uint8_t value) {
+    DEBUG_ASSERT(value < 64);
+    max_virtual_address_size = std::max(max_virtual_address_size, value);
+  }
 
   enum CloseStatus {
     /**
@@ -317,12 +336,22 @@ private:
   // rename it, so our flock() lock stays held on it.
   ScopedFd version_fd;
   uint32_t mmap_count;
+  uint8_t max_virtual_address_size;
   bool has_cpuid_faulting_;
   bool xsave_fip_fdp_quirk_;
   bool fdp_exception_only_quirk_;
   bool clear_fip_fdp_;
   bool supports_file_data_cloning_;
   bool chaos_mode;
+};
+
+struct TraceUtsName {
+  std::string sysname;
+  std::string nodename;
+  std::string release;
+  std::string version;
+  std::string machine;
+  std::string domainname;
 };
 
 class TraceReader : public TraceStream {
@@ -335,6 +364,7 @@ public:
     std::vector<uint8_t> data;
     remote_ptr<void> addr;
     pid_t rec_tid;
+    MemWriteSizeValidation size_validation;
   };
 
   /**
@@ -345,6 +375,7 @@ public:
     remote_ptr<void> addr;
     pid_t rec_tid;
     std::vector<WriteHole> holes;
+    MemWriteSizeValidation size_validation;
   };
 
   /**
@@ -353,8 +384,11 @@ public:
    * NB: reading a trace frame has the side effect of ticking
    * the global time to match the time recorded in the trace
    * frame.
+   *
+   * For all frames before `skip_before` we only fill in the `global_time`
+   * field. (Raw data and maps are still accessible.)
    */
-  TraceFrame read_frame();
+  TraceFrame read_frame(FrameTime skip_before = 0);
 
   /**
    * Read the next mapped region descriptor and return it.
@@ -377,12 +411,6 @@ public:
    * Sets |*time| (if non-null) to the global time of the event.
    */
   TraceTaskEvent read_task_event(FrameTime* time = nullptr);
-
-  /**
-   * Read the next raw data record for this frame and return it. Aborts if
-   * there are no more raw data records for this frame.
-   */
-  RawData read_raw_data();
 
   /**
    * Reads the next raw data record for last-read frame. If there are no more
@@ -464,6 +492,8 @@ public:
 
   // The base syscall number for rr syscalls in this trace
   int rrcall_base() const { return rrcall_base_; }
+  uint32_t syscallbuf_fds_disabled_size() const { return syscallbuf_fds_disabled_size_; }
+  uint32_t syscallbuf_hdr_size() const { return syscallbuf_hdr_size_; }
 
   SupportedArch arch() const { return arch_; }
 
@@ -474,18 +504,33 @@ public:
   MemoryRange exclusion_range() const {
     return exclusion_range_;
   }
+  uint8_t max_virtual_address_size() const {
+    return max_virtual_address_size_;
+  }
+  bool cpu_improperly_configured(bool* known) const {
+    *known = cpu_improperly_configured_known_;
+    return cpu_improperly_configured_;
+  }
 
   enum TraceQuirks {
     // Whether the /proc/<pid>/mem calls were explicitly recorded in this trace
     ExplicitProcMem = 0x1,
     // Whether this trace requires the special librrpage replay behavior
     // added in 3aaf792 and later removed.
-    SpecialLibRRpage = 0x2
+    SpecialLibRRpage = 0x2,
+    // Whether this trace recorded extra regs for pkey_alloc(2).
+    PkeyAllocRecordedExtraRegs = 0x4,
+    // Whether this trace forced a tick after buffered syscalls.
+    BufferedSyscallForcedTick = 0x8,
+    // Whether this trace requires globals.is_replay to be toggled.
+    UsesGlobalsInReplay = 0x10,
   };
 
   int quirks() const { return quirks_; }
 
   int required_forward_compatibility_version() const { return required_forward_compatibility_version_; }
+
+  const TraceUtsName& uname() const { return uname_; }
 
 private:
   CompressedReader& reader(Substream s) { return *readers[s]; }
@@ -499,19 +544,26 @@ private:
   double monotonic_time_;
   std::unique_ptr<TraceUuid> uuid_;
   MemoryRange exclusion_range_;
+  TraceUtsName uname_;
   bool trace_uses_cpuid_faulting;
   bool preload_thread_locals_recorded_;
   bool clear_fip_fdp_;
   bool chaos_mode_known_;
   bool chaos_mode_;
   int rrcall_base_;
+  uint8_t max_virtual_address_size_;
+  bool cpu_improperly_configured_known_;
+  bool cpu_improperly_configured_;
+  uint32_t syscallbuf_fds_disabled_size_;
+  uint32_t syscallbuf_hdr_size_;
   int required_forward_compatibility_version_;
   SupportedArch arch_;
   int quirks_;
 };
 
-extern std::string trace_save_dir();
-extern std::string resolve_trace_name(const std::string& trace_name);
+std::string trace_save_dir();
+std::string resolve_trace_name(const std::string& trace_name);
+std::string latest_trace_symlink();
 
 } // namespace rr
 

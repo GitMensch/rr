@@ -25,7 +25,10 @@ public:
   CompressedReader(const CompressedReader& aOther);
   ~CompressedReader();
   bool good() const { return !error; }
-  bool at_end() const { return eof && buffer_read_pos == buffer.size(); }
+  bool at_end() const {
+    const_cast<CompressedReader*>(this)->process_skip();
+    return eof && buffer_read_pos == buffer.size();
+  }
   // Returns true if successful. Otherwise there's an error and good()
   // will be false.
   bool read(void* data, size_t size);
@@ -33,7 +36,9 @@ public:
   // Returns zero size if at EOF.
   bool get_buffer(const uint8_t** data, size_t* size);
   // Advances the read position by the given size.
-  bool skip(size_t size);
+  void skip(size_t size) {
+    buffer_skip_bytes += size;
+  }
   void rewind();
   void close();
 
@@ -57,38 +62,9 @@ public:
   uint64_t uncompressed_bytes() const;
   uint64_t compressed_bytes() const;
 
-  template <typename T> CompressedReader& operator>>(T& value) {
-    read(&value, sizeof(value));
-    return *this;
-  }
-
-  CompressedReader& operator>>(std::string& value) {
-    value.empty();
-    while (true) {
-      char ch;
-      read(&ch, 1);
-      if (ch == 0) {
-        break;
-      }
-      value.append(1, ch);
-    }
-    return *this;
-  }
-
-  template <typename T> CompressedReader& operator>>(std::vector<T>& value) {
-    size_t len;
-    *this >> len;
-    value.resize(0);
-    for (size_t i = 0; i < len; ++i) {
-      T v;
-      *this >> v;
-      value.push_back(v);
-    }
-    return *this;
-  }
-
 protected:
-  bool refill_buffer();
+  void process_skip();
+  bool refill_buffer(size_t* skip_bytes = nullptr);
 
   /* Our fd might be the dup of another fd, so we can't rely on its current file
      position.
@@ -98,7 +74,9 @@ protected:
   bool error;
   bool eof;
   std::vector<uint8_t> buffer;
+  // within `buffer`
   size_t buffer_read_pos;
+  size_t buffer_skip_bytes;
 
   bool have_saved_state;
   bool have_saved_buffer;

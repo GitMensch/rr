@@ -9,6 +9,7 @@
 #include <string>
 
 #include "kernel_abi.h"
+#include "remote_ptr.h"
 
 namespace rr {
 
@@ -61,11 +62,6 @@ const char *errno_name_cstr(int err);
  */
 std::string sicode_name(int code, int sig);
 
-/**
- * Print siginfo on ostream.
- */
-std::ostream& operator<<(std::ostream& stream, const siginfo_t& siginfo);
-
 int shm_flags_to_mmap_prot(int flags);
 
 /**
@@ -77,6 +73,32 @@ std::string xsave_feature_string(uint64_t xsave_features);
  * Return whether this is a core dumping signal or not.
  */
 bool is_coredumping_signal(int signo);
+
+/**
+ * Convert a raw native siginfo_t to our arch siginfo_t.
+ */
+NativeArch::siginfo_t convert_to_native_siginfo(SupportedArch arch,
+    const void* data, size_t size);
+
+/**
+ * Stringify the prot bits.
+ */
+std::string prot_flags_string(int prot);
+
+/**
+ * Return the number of usable address space bits for this arch.
+ */
+int addr_bits(SupportedArch arch);
+
+/**
+ * Return the end of the usable address space for this arch.
+ */
+remote_ptr<void> usable_address_space_end(SupportedArch arch);
+
+/**
+ * Convert an rlimit resource name to a string.
+ */
+std::string rlimit_resource_name(int resource);
 
 } // namespace rr
 

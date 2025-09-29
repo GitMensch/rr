@@ -14,6 +14,7 @@
 #include "Flags.h"
 #include "RecordSession.h"
 #include "StringVectorToCharArray.h"
+#include "WaitManager.h"
 #include "WaitStatus.h"
 #include "core.h"
 #include "git_revision.h"
@@ -65,18 +66,22 @@ RecordCommand RecordCommand::singleton(
     "  --syscall-buffer-sig=<NUM> the signal used for communication with the\n"
     "                             syscall buffer. SIGPWR by default, unused\n"
     "                             if --no-syscall-buffer is passed\n"
+    "  -s, --always-switch        Context-switch after every rr event\n"
+    "                             (mainly for testing)\n"
     "  -t, --continue-through-signal=<SIG>\n"
     "                             Unhandled <SIG> signals will be ignored\n"
     "                             instead of terminating the program. The\n"
     "                             signal will still be delivered for user\n"
     "                             handlers and debugging.\n"
+    "  --intel-pt                 Enable PT collection of control flow\n"
+    "                             (for debugging rr)\n"
     "  -u, --cpu-unbound          allow tracees to run on any virtual CPU.\n"
     "                             Default is to bind to a random CPU.  This "
     "option\n"
     "                             can cause replay divergence: use with\n"
     "                             caution.\n"
-    "  --bind-to-cpu=<NUM>        Bind to a particular CPU\n"
-    "                             instead of a randomly chosen one.\n"
+    "  --bind-to-cpu=<CORE>       Bind to a CPU core. <CORE> can be 'any',\n"
+    "                             'p-core' (default), or a specific number.\n"
     "  -v, --env=NAME=VALUE       value to add to the environment of the\n"
     "                             tracee. There can be any number of these.\n"
     "  -w, --wait                 Wait for all child processes to exit, not\n"
@@ -97,7 +102,11 @@ RecordCommand RecordCommand::singleton(
     "  --stap-sdt                 Enables the use of SystemTap statically-\n"
     "                             defined tracepoints\n"
     "  --asan                     Override heuristics and always enable ASAN\n"
-    "                             compatibility.\n");
+    "                             compatibility.\n"
+    "  --tsan                     Override heuristics and always enable TSAN\n"
+    "                             compatibility.\n"
+    "  --check-outside-mmaps      Try to identify files that are mapped outside\n"
+    "                             of the trace and could cause diversions.\n");
 
 struct RecordFlags {
   vector<string> extra_env;
@@ -174,6 +183,16 @@ struct RecordFlags {
   /* True if we should always enable ASAN compatibility. */
   bool asan;
 
+  /* True if we should always enable TSAN compatibility. */
+  bool tsan;
+
+  /* True if we should enable collection of control flow
+     with PT. */
+  bool intel_pt;
+
+  /* True if we should check files being mapped outside of the recording. */
+  bool check_outside_mmaps;
+
   RecordFlags()
       : max_ticks(Scheduler::DEFAULT_MAX_TICKS),
         ignore_sig(0),
@@ -184,7 +203,7 @@ struct RecordFlags {
         output_trace_dir(""),
         use_file_cloning(true),
         use_read_cloning(true),
-        bind_cpu(BIND_CPU),
+        bind_cpu(BindCPU::PREFER_PERF_CORE),
         always_switch(false),
         chaos(false),
         num_cores(0),
@@ -196,7 +215,10 @@ struct RecordFlags {
         syscallbuf_desched_sig(SYSCALLBUF_DEFAULT_DESCHED_SIGNAL),
         stap_sdt(false),
         unmap_vdso(false),
-        asan(false) {}
+        asan(false),
+        tsan(false),
+        intel_pt(false),
+        check_outside_mmaps(false) {}
 };
 
 static void parse_signal_name(ParsedOption& opt) {
@@ -257,6 +279,9 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     { 15, "unmap-vdso", NO_PARAMETER },
     { 16, "disable-avx-512", NO_PARAMETER },
     { 17, "asan", NO_PARAMETER },
+    { 18, "tsan", NO_PARAMETER },
+    { 19, "intel-pt", NO_PARAMETER },
+    { 20, "check-outside-mmaps", NO_PARAMETER },
     { 'c', "num-cpu-ticks", HAS_PARAMETER },
     { 'h', "chaos", NO_PARAMETER },
     { 'i', "ignore-signal", HAS_PARAMETER },
@@ -311,11 +336,10 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
       flags.use_file_cloning = false;
       break;
     case 2:
-      if (!opt.verify_valid_int(4, 1024 * 1024) ||
-          (opt.int_value & (page_size() / 1024 - 1))) {
+      if (!opt.verify_valid_int(4, 1024 * 1024)) {
         return false;
       }
-      flags.syscall_buffer_size = opt.int_value * 1024;
+      flags.syscall_buffer_size = ceil_page_size(opt.int_value * 1024);
       break;
     case 3:
       if (opt.value == "default" || opt.value == "error") {
@@ -338,10 +362,16 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
       flags.setuid_sudo = true;
       break;
     case 6:
-      if (!opt.verify_valid_int(0, INT32_MAX)) {
-        return false;
+      if (opt.value == "any") {
+        flags.bind_cpu = BindCPU(BindCPU::ANY);
+      } else if (opt.value == "p-core") {
+        flags.bind_cpu = BindCPU(BindCPU::PREFER_PERF_CORE);
+      } else {
+        if (!opt.verify_valid_int(0, INT32_MAX)) {
+          return false;
+        }
+        flags.bind_cpu = BindCPU(opt.int_value);
       }
-      flags.bind_cpu = BindCPU(opt.int_value);
       break;
     case 7: {
       vector<uint32_t> bits = parse_feature_bits(opt);
@@ -385,8 +415,8 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     }
     case 11: {
       const uint8_t SUM_GROUP_LENS[5] = { 8, 12, 16, 20, 32 };
-      /* Parse UUIDs from string form optionally with hypens */
-      uint8_t digit = 0; // This counts only hex digits (i.e. not hypens)
+      /* Parse UUIDs from string form optionally with hyphens */
+      uint8_t digit = 0; // This counts only hex digits (i.e. not hyphens)
       uint8_t group = 0;
       uint8_t acc = 0;
       unique_ptr<TraceUuid> buf(new TraceUuid);
@@ -468,6 +498,15 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     case 17:
       flags.asan = true;
       break;
+    case 18:
+      flags.tsan = true;
+      break;
+    case 19:
+      flags.intel_pt = true;
+      break;
+    case 20:
+      flags.check_outside_mmaps = true;
+      break;
     case 's':
       flags.always_switch = true;
       break;
@@ -479,7 +518,7 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
       flags.continue_through_sig = opt.int_value;
       break;
     case 'u':
-      flags.bind_cpu = UNBOUND_CPU;
+      flags.bind_cpu = BindCPU(BindCPU::UNBOUND);
       break;
     case 'v':
       flags.extra_env.push_back(opt.value);
@@ -496,14 +535,20 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
 }
 
 static volatile double term_requested;
+static bool did_print_reassurance = false;
+
+static const double TRACEE_SIGTERM_RESPONSE_MAX_TIME = 5;
+static const double RR_SIGKILL_GRACE_TIME = 5;
 
 /**
  * A terminating signal was received.
  *
- * If a term request has been pending for more than one second,
+ * First we forward it to the tracee. Then if the tracee is still
+ * running after TRACEE_SIGTERM_RESPONSE_MAX_TIME, we kill it with SIGKILL.
+ * If a term request remains pending for more than one second,
  * then assume rr is wedged and abort().
  *
- * Note that this is not only called in a signal handler but it could
+ * Note that this is called in a signal handler and could also
  * be called off the main thread.
  */
 static void handle_SIGTERM(__attribute__((unused)) int sig) {
@@ -511,12 +556,16 @@ static void handle_SIGTERM(__attribute__((unused)) int sig) {
   // that could allocate, we could deadlock.
   if (term_requested > 0) {
     double now = monotonic_now_sec();
-    if (now - term_requested > 1) {
-      static const char msg[] =
-        "Received SIGTERM while an earlier one was pending.  We're "
-        "probably wedged.\n";
-      write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
-      notifying_abort();
+    if (now - term_requested > 1 + TRACEE_SIGTERM_RESPONSE_MAX_TIME) {
+      if (!did_print_reassurance) {
+        static const char msg[] =
+          "[rr] Tracee failed to exit within 1s after SIGKILL. Recording will forcibly terminate in 4s.\n";
+        did_print_reassurance = true;
+        write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
+      } else if (now - term_requested > RR_SIGKILL_GRACE_TIME + TRACEE_SIGTERM_RESPONSE_MAX_TIME) {
+        errno = 0;
+        FATAL() << "SIGTERM grace period expired";
+      }
     }
   } else {
     term_requested = monotonic_now_sec();
@@ -528,10 +577,8 @@ static void handle_SIGTERM(__attribute__((unused)) int sig) {
  * give a stacktrace.
  */
 static void handle_SIGSEGV(__attribute__((unused)) int sig) {
-  static const char msg[] =
-    "rr itself crashed (SIGSEGV). This shouldn't happen!\n";
-  write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
-  notifying_abort();
+  errno = 0;
+  FATAL() << "rr itself crashed (SIGSEGV). This shouldn't happen!";
 }
 
 static void install_signal_handlers(void) {
@@ -548,6 +595,10 @@ static void install_signal_handlers(void) {
   sigaction(SIGINT, &sa, nullptr);
   sigaction(SIGABRT, &sa, nullptr);
   sigaction(SIGQUIT, &sa, nullptr);
+  sigaction(SIGTRAP, &sa, nullptr);
+  sigaction(SIGTTIN, &sa, nullptr);
+  sigaction(SIGTTOU, &sa, nullptr);
+  sigaction(SIGWINCH, &sa, nullptr);
 }
 
 static void setup_session_from_flags(RecordSession& session,
@@ -610,9 +661,11 @@ static void copy_preload_sources_to_trace(const string& trace_dir) {
     FATAL() << "Can't spawn 'zip'";
   }
   posix_spawn_file_actions_destroy(&actions);
-  int status;
-  waitpid(pid, &status, 0);
-  LOG(info) << "Got zip status " << WaitStatus(status);
+  WaitResult result = WaitManager::wait_exit(WaitOptions(pid));
+  if (result.code != WAIT_OK) {
+    FATAL() << "Wait failed";
+  }
+  LOG(info) << "Got zip status " << result.status;
 }
 
 static void save_rr_git_revision(const string& trace_dir) {
@@ -626,6 +679,18 @@ static void save_rr_git_revision(const string& trace_dir) {
   }
 }
 
+static void* repeat_SIGTERM(__attribute__((unused)) void* p) {
+  sleep_time(TRACEE_SIGTERM_RESPONSE_MAX_TIME);
+  /* send another SIGTERM so we wake up and SIGKILL our tracees */
+  kill(getpid(), SIGTERM);
+  sleep_time(RR_SIGKILL_GRACE_TIME);
+  /* Ok, now we're really wedged, just repeatedly SIGTERM until we're out */
+  while (1) {
+    kill(getpid(), SIGTERM);
+    sleep_time(0.01);
+  }
+}
+
 static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   LOG(info) << "Start recording...";
 
@@ -634,7 +699,8 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
       flags.use_syscall_buffer, flags.syscallbuf_desched_sig,
       flags.bind_cpu, flags.output_trace_dir,
       flags.trace_id.get(),
-      flags.stap_sdt, flags.unmap_vdso, flags.asan);
+      flags.stap_sdt, flags.unmap_vdso, flags.asan, flags.tsan,
+      flags.intel_pt, flags.check_outside_mmaps);
   setup_session_from_flags(*session, flags);
 
   static_session = session.get();
@@ -656,7 +722,9 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   install_signal_handlers();
 
   RecordSession::RecordResult step_result;
+  bool did_forward_SIGTERM = false;
   bool did_term_detached_tasks = false;
+  pthread_t term_repeater_thread;
   do {
     bool done_initial_exec = session->done_initial_exec();
     step_result = session->record_step();
@@ -665,7 +733,17 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
       session->trace_writer().make_latest_trace();
     }
     if (term_requested) {
-      session->terminate_tracees();
+      if (monotonic_now_sec() - term_requested > TRACEE_SIGTERM_RESPONSE_MAX_TIME) {
+        /* time ran out for the tracee to respond to SIGTERM; kill everything */
+        session->terminate_tracees();
+      } else if (!did_forward_SIGTERM) {
+        session->forward_SIGTERM();
+        // Start a thread to send a SIGTERM to ourselves (again)
+        // in case the tracee doesn't respond to SIGTERM.
+        pthread_create(&term_repeater_thread, NULL, repeat_SIGTERM, NULL);
+        did_forward_SIGTERM = true;
+      }
+      /* Forward SIGTERM to detached tasks immediately */
       if (!did_term_detached_tasks) {
         session->term_detached_tasks();
         did_term_detached_tasks = true;
@@ -746,6 +824,30 @@ static void reset_uid_sudo() {
   prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0);
 }
 
+static ScopedFd open_controlling_terminal_if_foreground_process_group_leader() {
+  char path[L_ctermid + 1];
+  ctermid(path);
+  ScopedFd terminal_fd(path, O_RDONLY);
+  if (terminal_fd.is_open()) {
+    pid_t fg_process_group = tcgetpgrp(terminal_fd);
+    if (fg_process_group != getpid()) {
+      terminal_fd.close();
+    }
+  }
+  return terminal_fd;
+}
+
+static void detach_teleport() {
+  int ret = syscall(SYS_rrcall_detach_teleport, (uintptr_t)0, (uintptr_t)0,
+    (uintptr_t)0, (uintptr_t)0, (uintptr_t)0, (uintptr_t)0);
+  if (ret < 0) {
+    FATAL() << "Failed to detach from parent rr";
+  }
+  if (running_under_rr(false)) {
+    FATAL() << "Detaching from parent rr did not work";
+  }
+}
+
 int RecordCommand::run(vector<string>& args) {
   RecordFlags flags;
   while (parse_record_arg(args, flags)) {
@@ -758,18 +860,35 @@ int RecordCommand::run(vector<string>& args) {
         return 1;
       case NESTED_DETACH:
       case NESTED_RELEASE: {
-        int ret = syscall(SYS_rrcall_detach_teleport, (uintptr_t)0, (uintptr_t)0,
-          (uintptr_t)0, (uintptr_t)0, (uintptr_t)0, (uintptr_t)0);
-        if (ret < 0) {
-          FATAL() << "Failed to detach from parent rr";
+        bool is_process_group_leader = getpgrp() == getpid();
+        ScopedFd terminal_fd = open_controlling_terminal_if_foreground_process_group_leader();
+
+        detach_teleport();
+
+        if (is_process_group_leader) {
+          setpgid(0, 0);
         }
-        if (running_under_rr(false)) {
-          FATAL() << "Detaching from parent rr did not work";
+        if (terminal_fd.is_open()) {
+          struct sigaction sa;
+          struct sigaction sa_old;
+          memset(&sa, 0, sizeof(sa));
+          sa.sa_handler = SIG_IGN;
+          // Ignore SIGTTOU while we change settings, we don't want it to stop us
+          sigaction(SIGTTOU, &sa, &sa_old);
+          int ret = tcsetpgrp(terminal_fd, getpid());
+          if (ret) {
+            LOG(warn) << "Failed to make ourselves the foreground process: " << errno_name(errno);
+          }
+          sigaction(SIGTTOU, &sa_old, nullptr);
         }
+
         if (flags.nested == NESTED_RELEASE) {
           exec_child(args);
           return 1;
         }
+        // running_under_rr() changed - respect the log specification from RR_LOG
+        // just as if we hadn't been running under rr.
+        apply_log_spec_from_env();
         break;
       }
       default:
@@ -790,7 +909,7 @@ int RecordCommand::run(vector<string>& args) {
   if (flags.setuid_sudo) {
     if (geteuid() != 0 || getenv("SUDO_UID") == NULL) {
       fprintf(stderr, "rr: --setuid-sudo option may only be used under sudo.\n"
-                      "Re-run as `sudo -EP --preserve-env=HOME rr record --setuid-sudo` to"
+                      "Re-run as `sudo -EP --preserve-env=HOME rr record --setuid-sudo` to "
                       "record privileged executables.\n");
       return 1;
     }

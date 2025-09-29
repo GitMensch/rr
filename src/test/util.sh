@@ -20,6 +20,12 @@
 # scheduler, don't use it for anything else.
 #
 
+if ! which pidof &> /dev/null; then
+    pidof() {
+        ps ax -o 'pid= exe=' | grep ' \(\|.*/\)'"$1"'$' | awk '{print $1}'
+    }
+fi
+
 #  delay_kill <sig> <delay_secs> <proc>
 #
 # Deliver the signal |sig|, after waiting |delay_secs| seconds, to the
@@ -74,9 +80,15 @@ function fatal { #...
 function onexit {
     cd
     if [[ "$test_passed" == "y" ]]; then
-        rm -rf $workdir
+        if [[ "$tmp_workdir" != "" ]]; then
+            rm -rf $tmp_workdir
+        fi
+        if [[ "$nontmp_workdir" != "" ]]; then
+            rm -rf $nontmp_workdir
+        fi
     else
-        echo Test $TESTNAME failed, leaving behind $workdir
+        echo -n Test $TESTNAME failed, leaving behind $tmp_workdir
+        (rmdir "$nontmp_workdir" 2>/dev/null && echo) || echo " and $nontmp_workdir"
         echo To replay the failed test, run
         echo " " _RR_TRACE_DIR="$workdir" rr replay
         exit 1
@@ -91,7 +103,10 @@ function usage {
     echo Usage: "util.sh TESTNAME [LIB_ARG] [OBJDIR]"
 }
 
-GLOBAL_OPTIONS="--suppress-environment-warnings --check-cached-mmaps --fatal-errors"
+GLOBAL_OPTIONS="--suppress-environment-warnings --fatal-errors"
+if [[ "$NO_CHECK_CACHED_MMAP" == "" ]]; then
+    GLOBAL_OPTIONS="${GLOBAL_OPTIONS} --check-cached-mmaps"
+fi
 
 SRCDIR=`dirname ${BASH_SOURCE[0]}`/../..
 SRCDIR=`realpath $SRCDIR`
@@ -107,6 +122,10 @@ if [[ $TESTNAME =~ ([A-Za-z0-9_]+)_32$ ]]; then
 else
     TESTNAME_NO_BITNESS=$TESTNAME
 fi
+
+# We may want to retrieve this from python
+export TESTNAME=$TESTNAME
+
 LIB_ARG=$2
 OBJDIR=$3
 if [[ "$OBJDIR" == "" ]]; then
@@ -125,6 +144,11 @@ fi
 
 # The temporary directory we create for this test run.
 workdir=
+# A temporary directory likely to be in a tmpfs. Usually same as 'workdir'.
+tmp_workdir=
+# Another temporary directory that we created for this test run, in a real
+# (non-tmpfs) filesystem if possible. It might be empty or still in a tmpfs.
+nontmp_workdir=
 # Did the test pass?  If not, then we'll leave the recording and
 # output around for developers to debug, and exit with a nonzero
 # exit code.
@@ -133,7 +157,7 @@ test_passed=y
 nonce=
 
 # Set up the environment and working directory.
-TESTDIR="${SRCDIR}/src/test"
+export TESTDIR="${SRCDIR}/src/test"
 
 # Make rr treat temp files as durable. This saves copying all test
 # binaries into the trace.
@@ -147,7 +171,7 @@ export PATH="${OBJDIR}/bin:${PATH}"
 
 # Resource path is normally the same as the build directory, however, it is
 # slightly different when using the installable testsuite. The installable
-# testsuite will look for resources under DESTDIR/CMAKE_INSATALL_PREFIX. We
+# testsuite will look for resources under DESTDIR/CMAKE_INSTALL_PREFIX. We
 # can detect if it's the installable testsuite being run by checking if the
 # rr binary exists in the build directory.
 if [[ -f "$OBJDIR/bin/rr" ]]; then
@@ -183,7 +207,12 @@ ulimit -c 0
 # NB: must set up the trap handler *before* mktemp
 trap onexit EXIT
 workdir=`mktemp -dt rr-test-$TESTNAME-XXXXXXXXX`
+tmp_workdir=$workdir
+nontmp_workdir=`mktemp -p $PWD -dt rr-test-$TESTNAME-XXXXXXXXX`
 cd $workdir
+# NB: the testsuite should run on any system with different settings,
+#     so create a reasonable default for all tests
+export LC_ALL=C
 
 # XXX technically the trailing -XXXXXXXXXX isn't unique, since there
 # could be "foo-123456789" and "bar-123456789", but if that happens,
@@ -206,6 +235,16 @@ function fails { why=$1;
 function skip_if_no_syscall_buf {
     if [[ "-n" == "$LIB_ARG" ]]; then
         echo NOTE: Skipping "'$TESTNAME'" because syscallbuf is disabled
+        exit 0
+    fi
+}
+
+# If the systemd version doesn't allow disabling RDRAND, skip the test,
+# because it might trigger systemd code.
+function skip_if_old_systemd {
+    systemd_version=`systemctl --version | head -n1 | cut -d' ' -f2`
+    if [[ $systemd_version != "" && $systemd_version < 247 ]]; then
+        echo "can't disable RDRAND for systemd, skipping test"
         exit 0
     fi
 }
@@ -244,7 +283,7 @@ function skip_if_syscall_buf {
 
 function just_record { exe="$1"; exeargs=$2;
     _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT record.err \
-        $RR_EXE $GLOBAL_OPTIONS record $LIB_ARG $RECORD_ARGS "$exe" $exeargs 1> record.out 2> record.err
+        $RR_EXE $GLOBAL_OPTIONS record --bind-to-cpu=any $LIB_ARG $RECORD_ARGS "$exe" $exeargs 1> record.out 2> record.err
 }
 
 function save_exe { exe=$1;
@@ -256,6 +295,13 @@ function save_exe { exe=$1;
         EXE_PATH=$RESOURCE_PATH/bin/$exe
     fi
     cp "${EXE_PATH}" "$exe-$nonce"
+}
+
+function switch_to_nontmp_workdir_if_possible {
+    if [[ "$nontmp_workdir" != "" ]]; then
+        workdir=$nontmp_workdir
+        cd $workdir
+    fi
 }
 
 # Record $exe with $exeargs.
@@ -277,12 +323,18 @@ function record_async_signal { sig=$1; delay_secs=$2; exe=$3; exeargs=$4;
 
 function replay { replayflags=$1
     _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT replay.err \
-        $RR_EXE $GLOBAL_OPTIONS replay -a $replayflags 1> replay.out 2> replay.err
+        $RR_EXE $GLOBAL_OPTIONS replay --retry-transient-errors -a \
+        $replayflags 1> replay.out 2> replay.err
 }
 
 function rerun { rerunflags=$1
     _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT rerun.err \
         $RR_EXE $GLOBAL_OPTIONS rerun $rerunflags 1> rerun.out 2> rerun.err
+}
+
+function pack {
+    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT pack.err \
+        $RR_EXE $GLOBAL_OPTIONS pack $@ 1> pack.out 2> pack.err
 }
 
 function do_ps { psflags=$1
@@ -291,22 +343,47 @@ function do_ps { psflags=$1
 }
 
 #  debug <expect-script-name> [replay-args]
+function debug {
+    debug_gdb_only $TEST_PREFIX$TESTNAME_NO_BITNESS
+    if [[ "$test_passed" == "y" ]]; then
+        debug_lldb_only $TEST_PREFIX$TESTNAME_NO_BITNESS
+    fi
+}
+
+#  debug_lldb_only <expect-script-name> [replay-args]
 #
 # Load the "expect" script to drive replay of the recording of |exe|.
-function debug { expectscript=$1; replayargs=$2
-    _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT debug.err \
-        python3 $TESTDIR/$expectscript.py \
-        $RR_EXE $GLOBAL_OPTIONS replay -o-n -x $TESTDIR/test_setup.gdb $replayargs
+# Only LLDB is tested.
+function debug_lldb_only { expectscript=$1; replayargs=$2
+    RR_LOG_FILE=rr.log _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT test-monitor.output \
+        python3 $TESTDIR/$expectscript.py --lldb \
+        $RR_EXE $GLOBAL_OPTIONS replay $replayargs
     if [[ $? == 0 ]]; then
-        passed
+        passed_msg lldb
     else
-        failed "debug script failed"
+        failed "debug script failed (lldb); see `pwd`/lldb_rr.log and `pwd`/test-monitor.output"
         echo "--------------------------------------------------"
-        echo "gdb_rr.log:"
-        cat gdb_rr.log
+        echo "rr.log:"
+        cat rr.log
         echo "--------------------------------------------------"
-        echo "debug.err:"
-        cat debug.err
+    fi
+}
+
+#  debug_gdb_only <expect-script-name> [replay-args]
+#
+# Load the "expect" script to drive replay of the recording of |exe|.
+# Only GDB is tested.
+function debug_gdb_only { expectscript=$1; replayargs=$2
+    RR_LOG_FILE=rr.log _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT test-monitor.output \
+        python3 $TESTDIR/$expectscript.py \
+        $RR_EXE $GLOBAL_OPTIONS replay -o-n -o-ix -o$TESTDIR/test_setup.gdb $replayargs
+    if [[ $? == 0 ]]; then
+        passed_msg gdb
+    else
+        failed "debug script failed (gdb); see `pwd`/gdb_rr.log and `pwd`/test-monitor.output"
+        echo "--------------------------------------------------"
+        echo "rr.log:"
+        cat rr.log
         echo "--------------------------------------------------"
     fi
 }
@@ -318,6 +395,10 @@ function failed { msg=$1;
 
 function passed {
     echo "Test '$TESTNAME' PASSED"
+}
+
+function passed_msg { msg=$1
+    echo "Test '$TESTNAME' PASSED ($msg)"
 }
 
 function just_check_replay_err {
@@ -430,7 +511,17 @@ function compare_test { token=$1; replayflags=$2;
 # computing test pass/fail.
 function debug_test {
     record $TESTNAME
-    debug $TEST_PREFIX$TESTNAME_NO_BITNESS
+    debug
+}
+
+#  debug_test_gdb_only
+#
+# Record the test name passed to |util.sh|, then replay the recording
+# using the "expect" script $test-name.py, which is responsible for
+# computing test pass/fail. Only GDB is tested.
+function debug_test_gdb_only {
+    record $TESTNAME
+    debug_gdb_only $TEST_PREFIX$TESTNAME_NO_BITNESS
 }
 
 #  rerun_singlestep_test
@@ -442,13 +533,18 @@ function rerun_singlestep_test {
     rerun "--singlestep=rip,gp_x16,flags"
 }
 
+# Return an rr dump result of the most recent local recording.
+function get_events {
+    $RR_EXE $GLOBAL_OPTIONS dump "$@" latest-trace
+}
+
 # Return the number of events in the most recent local recording.
 function count_events {
-    local events=$($RR_EXE $GLOBAL_OPTIONS dump -r latest-trace | wc -l)
+    local events=$(get_events -r | wc -l)
     # The |simple| test is just about the simplest possible C program,
     # and has around 180 events (when recorded on a particular
     # developer's machine).  If we count a number of events
-    # significalty less than that, almost certainly something has gone
+    # significantly less than that, almost certainly something has gone
     # wrong.
     if [ "$events" -le 150 ]; then
         failed ": Recording had too few events.  Is |rr dump -r| broken?"
@@ -486,9 +582,34 @@ function checkpoint_test { exe=$1; min=$2; max=$3;
     stride=$(rand_range $min $max)
     for i in $(seq 1 $stride $num_events); do
         echo Checkpointing at event $i ...
-        debug restart_finish "-g $i"
+        debug_gdb_only restart_finish "-g $i"
         if [[ "$test_passed" != "y" ]]; then
             break
         fi
     done
+}
+
+function wait_for_complete {
+    local record_dir=${1:-"${workdir}/latest-trace"}
+    for ((i = 0; i < $TIMEOUT * 10; i++)); do
+        [[ -f "$record_dir/incomplete" ]] || break
+        sleep 0.1
+    done
+}
+
+# If not given by user, try to find out if C.UTF-8 or en_US.UTF-8 is available, if not use any UTF-8 locale.
+function set_utf_locale {
+    unset LC_ALL
+    if [ -z "$(which locale)" ]; then
+        if [ -z "$LC_ALL" ]; then export LC_ALL=en_US.UTF-8; fi
+    else
+        if [ -z "$LC_ALL" ]; then export LC_ALL=$(locale -a | grep -i -E "C\.utf.*8" | head -n1); fi
+        if [ -z "$LC_ALL" ]; then export LC_ALL=$(locale -a | grep -i -E "en_US\.utf.*8" | head -n1); fi
+        if [ -z "$LC_ALL" ]; then export LC_ALL=$(locale -a | grep -i -E ".*\.utf.*8" | head -n1); fi
+        if [ -z "$LC_ALL" ]; then
+            echo "Warning: no UTF-8 locale found."
+        else
+            echo "Using LC_ALL=$LC_ALL"
+        fi
+    fi
 }

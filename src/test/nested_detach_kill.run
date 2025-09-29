@@ -26,12 +26,19 @@ kill -TERM $rrpid
 echo "  done."
 
 # Wait for 'record' to actually terminate.
-wait
+wait $SUB_ID
+EXIT_CODE=$?
+if [[ $EXIT_CODE != 143 ]]; then
+  failed "Unexpected exit $EXIT_CODE"
+fi
 
 # Replay outer
 replay
 # Replay inner
 cd $workdir/inner
+workdir_orig=$workdir
 workdir=$PWD
+wait_for_complete
 replay
 check_replay_token $SYNC_TOKEN
+workdir=$workdir_orig

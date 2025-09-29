@@ -1,30 +1,22 @@
 from util import *
 
-send_gdb('b breakpoint')
-expect_gdb('Breakpoint 1')
+breakpoint = breakpoint_at_function('breakpoint')
 
-send_gdb('c')
-expect_gdb('Breakpoint 1')
-send_gdb('watch -l *p2')
-expect_gdb('Hardware watchpoint 2')
-send_gdb('c')
-expect_gdb('watchpoint 2')
-send_gdb('delete 2')
+def test():
+    for size in [2, 4, 8]:
+        cont()
+        expect_breakpoint_stop(breakpoint)
+        # Get the value of `wp_addr` from the parent frame.
+        # On Ubuntu 20 LTS, gdb stops before the `breakpoint` prelude so
+        # gets the wrong value of `wp_addr`.
+        up()
+        expect_debugger('test')
+        wp = watchpoint_at_address('wp_addr', size)
+        cont()
+        expect_watchpoint_stop(wp)
+        delete_watchpoint(wp)
 
-send_gdb('c')
-expect_gdb('Breakpoint 1')
-send_gdb('watch -l *p4')
-expect_gdb('Hardware watchpoint 3')
-send_gdb('c')
-expect_gdb('watchpoint 3')
-send_gdb('delete 3')
-
-send_gdb('c')
-expect_gdb('Breakpoint 1')
-send_gdb('watch -l *p8')
-expect_gdb('Hardware watchpoint 4')
-send_gdb('c')
-expect_gdb('watchpoint 4')
-send_gdb('delete 4')
-
+test()
+test()
+test()
 ok()

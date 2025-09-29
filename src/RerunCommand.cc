@@ -7,10 +7,12 @@
 #include <limits>
 
 #include "Command.h"
+#include "ExportImportCheckpoints.h"
 #include "Flags.h"
 #include "GdbServer.h"
 #include "ReplaySession.h"
 #include "ScopedFd.h"
+#include "TraceField.h"
 #include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
@@ -32,6 +34,8 @@ public:
 
 protected:
   RerunCommand(const char* name, const char* help) : Command(name, help) {}
+  // command_for_checkpoint is an in and out parameter.
+  int run_internal(CommandForCheckpoint& command_for_checkpoint);
 
   static RerunCommand singleton;
 };
@@ -44,6 +48,13 @@ RerunCommand RerunCommand::singleton(
     "                             address and jump to <ADDR> to fake call\n"
     "  --singlestep=<REGS>        dump <REGS> after each singlestep\n"
     "  --event-regs=<REGS>        dump <REGS> after each event\n"
+    "  --export-checkpoints=<EVENT>,<NUM>,<FILE>\n"
+    "                             Run to start of <EVENT> and then export checkpoints over\n"
+    "                             Unix socket at <FILE>. Exit after <NUM>\n"
+    "                             connections to the socket.\n"
+    "  --import-checkpoint=<FILE> Start the replay by importing a checkpoint from\n"
+    "                             another rr instance exporting checkpoints at\n"
+    "                             <FILE>\n"
     "  -r, --raw                  dump registers in raw format\n"
     "  -s, --trace-start=<EVENT>  start tracing at <EVENT>\n"
     "  -u, --cpu-unbound          allow replay to run on any CPU. Default is\n"
@@ -61,395 +72,27 @@ RerunCommand RerunCommand::singleton(
     "where tracee state changes without any user-level instructions actually\n"
     "being executed.\n");
 
-enum TraceFieldKind {
-  TRACE_EVENT_NUMBER,      // outputs 64-bit value
-  TRACE_INSTRUCTION_COUNT, // outputs 64-bit value
-  TRACE_IP,                // outputs 64-bit value
-  TRACE_FSBASE,            // outputs 64-bit value
-  TRACE_GSBASE,            // outputs 64-bit value
-  TRACE_FLAGS,             // outputs 64-bit value
-  TRACE_ORIG_AX,           // outputs 64-bit value
-  TRACE_SEG_REG,           // outputs 64-bit value
-  TRACE_XINUSE,            // outputs 64-bit value
-  TRACE_GP_REG,            // outputs 64-bit value
-  TRACE_XMM_REG,           // outputs 128-bit value
-  TRACE_YMM_REG,           // outputs 256-bit value
-  TRACE_FIP,               // outputs 64-bit value
-  TRACE_TID,               // outputs 32-bit value
-  TRACE_MXCSR,             // outputs 32-bit value
-  TRACE_TICKS,             // outputs 64-bit value
-};
-struct TraceField {
-  TraceFieldKind kind;
-  uint8_t reg_num;
-};
-
 struct RerunFlags {
   FrameTime trace_start;
   FrameTime trace_end;
   remote_code_ptr function;
   vector<TraceField> singlestep_trace;
   vector<TraceField> event_trace;
+  string import_checkpoint_socket;
+  string export_checkpoints_socket;
+  FrameTime export_checkpoints_event;
+  int export_checkpoints_count;
   bool raw;
   bool cpu_unbound;
 
   RerunFlags()
       : trace_start(0),
         trace_end(numeric_limits<decltype(trace_end)>::max()),
+        export_checkpoints_event(0),
+        export_checkpoints_count(0),
         raw(false),
         cpu_unbound(false) {}
 };
-
-#ifdef __x86_64__
-static uint8_t user_regs_fields[16] = {
-  offsetof(user_regs_struct, rax), offsetof(user_regs_struct, rcx),
-  offsetof(user_regs_struct, rdx), offsetof(user_regs_struct, rbx),
-  offsetof(user_regs_struct, rsp), offsetof(user_regs_struct, rbp),
-  offsetof(user_regs_struct, rsi), offsetof(user_regs_struct, rdi),
-  offsetof(user_regs_struct, r8),  offsetof(user_regs_struct, r9),
-  offsetof(user_regs_struct, r10), offsetof(user_regs_struct, r11),
-  offsetof(user_regs_struct, r12), offsetof(user_regs_struct, r13),
-  offsetof(user_regs_struct, r14), offsetof(user_regs_struct, r15),
-};
-#elif __i386__
-static uint8_t user_regs_fields[16] = {
-  offsetof(user_regs_struct, eax), offsetof(user_regs_struct, ecx),
-  offsetof(user_regs_struct, edx), offsetof(user_regs_struct, ebx),
-  offsetof(user_regs_struct, esp), offsetof(user_regs_struct, ebp),
-  offsetof(user_regs_struct, esi), offsetof(user_regs_struct, edi),
-};
-#elif defined(__aarch64__)
-#define user_regs_struct NativeArch::user_regs_struct
-static uint16_t user_regs_fields[34] = {
-  offsetof(user_regs_struct, x[0]), offsetof(user_regs_struct, x[1]),
-  offsetof(user_regs_struct, x[2]), offsetof(user_regs_struct, x[3]),
-  offsetof(user_regs_struct, x[4]), offsetof(user_regs_struct, x[5]),
-  offsetof(user_regs_struct, x[6]), offsetof(user_regs_struct, x[7]),
-  offsetof(user_regs_struct, x[8]), offsetof(user_regs_struct, x[9]),
-  offsetof(user_regs_struct, x[10]), offsetof(user_regs_struct, x[11]),
-  offsetof(user_regs_struct, x[12]), offsetof(user_regs_struct, x[13]),
-  offsetof(user_regs_struct, x[14]), offsetof(user_regs_struct, x[15]),
-  offsetof(user_regs_struct, x[16]), offsetof(user_regs_struct, x[17]),
-  offsetof(user_regs_struct, x[18]), offsetof(user_regs_struct, x[19]),
-  offsetof(user_regs_struct, x[20]), offsetof(user_regs_struct, x[21]),
-  offsetof(user_regs_struct, x[22]), offsetof(user_regs_struct, x[23]),
-  offsetof(user_regs_struct, x[24]), offsetof(user_regs_struct, x[25]),
-  offsetof(user_regs_struct, x[26]), offsetof(user_regs_struct, x[27]),
-  offsetof(user_regs_struct, x[28]), offsetof(user_regs_struct, x[29]),
-  offsetof(user_regs_struct, x[30]),
-  offsetof(user_regs_struct, sp),
-  offsetof(user_regs_struct, pc),
-  offsetof(user_regs_struct, pstate)
-};
-#undef user_regs_struct
-#else
-#error Unsupported architecture
-#endif
-
-static void print_hex(uint8_t* value, size_t size, FILE* out) {
-  bool any_printed = false;
-  for (ssize_t i = size - 1; i >= 0; --i) {
-    if (value[i] || any_printed || i == 0) {
-      fprintf(out, any_printed ? "%02x" : "%x", value[i]);
-      any_printed = true;
-    }
-  }
-}
-
-static void print_value(const char* name, void* value, size_t size,
-                        const RerunFlags& flags, FILE* out) {
-  if (flags.raw) {
-    fwrite(value, size, 1, out);
-  } else {
-    fprintf(out, "%s:0x", name);
-    print_hex(static_cast<uint8_t*>(value), size, out);
-  }
-}
-
-static const char gp_reg_names[16][4] = { "rax", "rcx", "rdx", "rbx",
-                                          "rsp", "rbp", "rsi", "rdi",
-                                          "r8",  "r9",  "r10", "r11",
-                                          "r12", "r13", "r14", "r15" };
-static const char gp_reg_names_32[8][4] = { "eax", "ecx", "edx", "ebx",
-                                            "esp", "ebp", "esi", "edi" };
-
-static const char seg_reg_names[6][3] = { "es", "cs", "ss", "ds", "fs", "gs" };
-
-static uint64_t seg_reg(const Registers& regs, uint8_t index) {
-  switch (index) {
-    case 0:
-      return regs.es();
-    case 1:
-      return regs.cs();
-    case 2:
-      return regs.ss();
-    case 3:
-      return regs.ds();
-    case 4:
-      return regs.fs();
-    case 5:
-      return regs.gs();
-    default:
-      FATAL() << "Unknown seg reg";
-      return 0;
-  }
-}
-
-static void print_regs(Task* t, FrameTime event, uint64_t instruction_count,
-                       const RerunFlags& flags, const vector<TraceField>& fields, FILE* out) {
-  if (fields.empty()) {
-    return;
-  }
-  union {
-    NativeArch::user_regs_struct gp_regs;
-    uintptr_t regs_values[sizeof(struct user_regs_struct) / sizeof(uintptr_t)];
-  };
-  bool got_gp_regs = false;
-  bool first = true;
-
-  for (auto& field : fields) {
-    if (first) {
-      first = false;
-    } else if (!flags.raw) {
-      fputc(' ', out);
-    }
-    switch (field.kind) {
-      case TRACE_EVENT_NUMBER: {
-        uint64_t value = event;
-        print_value("event", &value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_INSTRUCTION_COUNT:
-        print_value("icount", &instruction_count, sizeof(instruction_count),
-                    flags, out);
-        break;
-      case TRACE_IP: {
-        uint64_t value = t->regs().ip().register_value();
-        print_value(t->arch() == x86 ? "eip" : "rip", &value, sizeof(value),
-                    flags, out);
-        break;
-      }
-      case TRACE_FSBASE: {
-        uint64_t value = t->regs().fs_base();
-        print_value("fsbase", &value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_GSBASE: {
-        uint64_t value = t->regs().gs_base();
-        print_value("gsbase", &value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_FLAGS: {
-        uint64_t value = t->regs().flags();
-        print_value(t->arch() == x86 ? "eflags" : "rflags", &value,
-                    sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_ORIG_AX: {
-        uint64_t value = t->regs().original_syscallno();
-        print_value(t->arch() == x86 ? "orig_eax" : "orig_rax", &value,
-                    sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_SEG_REG: {
-        uint64_t value = seg_reg(t->regs(), field.reg_num);
-        print_value(seg_reg_names[field.reg_num], &value, sizeof(value), flags,
-                    out);
-        break;
-      }
-      case TRACE_XINUSE: {
-        bool defined;
-        uint64_t value = t->extra_regs().read_xinuse(&defined);
-        print_value("xinuse", &value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_GP_REG: {
-        if (!got_gp_regs) {
-          gp_regs = t->regs().get_ptrace();
-          got_gp_regs = true;
-        }
-        uint64_t value = field.reg_num < array_length(user_regs_fields)
-                             ? regs_values[user_regs_fields[field.reg_num] / 8]
-                             : 0;
-        if (field.reg_num == 0 && t->arch() == x86) {
-          // EAX->RAX is sign-extended, so undo that.
-          value = (uint32_t)value;
-        }
-        const char* name = (t->arch() == x86 && field.reg_num < 8)
-                               ? gp_reg_names_32[field.reg_num]
-                               : gp_reg_names[field.reg_num];
-        print_value(name, &value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_XMM_REG: {
-        uint8_t value[16];
-        bool defined;
-        switch (t->arch()) {
-          case x86:
-            if (field.reg_num < 8) {
-              t->extra_regs().read_register(
-                  value, GdbRegister(DREG_XMM0 + field.reg_num), &defined);
-            } else {
-              memset(value, 0, sizeof(value));
-            }
-            break;
-          case x86_64:
-            if (field.reg_num < 16) {
-              t->extra_regs().read_register(
-                  value, GdbRegister(DREG_64_XMM0 + field.reg_num), &defined);
-            } else {
-              memset(value, 0, sizeof(value));
-            }
-            break;
-          default:
-            FATAL() << "Unexpected architecture";
-        }
-        char buf[8];
-        sprintf(buf, "xmm%d", field.reg_num);
-        print_value(buf, value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_YMM_REG: {
-        uint8_t value[32];
-        bool defined;
-        switch (t->arch()) {
-          case x86:
-            if (field.reg_num < 8) {
-              t->extra_regs().read_register(
-                  value, GdbRegister(DREG_XMM0 + field.reg_num), &defined);
-              t->extra_regs().read_register(
-                  value + 16, GdbRegister(DREG_YMM0H + field.reg_num),
-                  &defined);
-            } else {
-              memset(value, 0, sizeof(value));
-            }
-            break;
-          case x86_64:
-            if (field.reg_num < 16) {
-              t->extra_regs().read_register(
-                  value, GdbRegister(DREG_64_XMM0 + field.reg_num), &defined);
-              t->extra_regs().read_register(
-                  value + 16, GdbRegister(DREG_64_YMM0H + field.reg_num),
-                  &defined);
-            } else {
-              memset(value, 0, sizeof(value));
-            }
-            break;
-          default:
-            FATAL() << "Unexpected architecture";
-        }
-        char buf[8];
-        sprintf(buf, "ymm%d", field.reg_num);
-        print_value(buf, value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_FIP: {
-        bool defined;
-        uint64_t value = t->extra_regs().read_fip(&defined);
-        print_value("fip", &value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_MXCSR: {
-        bool defined;
-        uint32_t value = t->extra_regs().read_mxcsr(&defined);
-        print_value("mxcsr", &value, sizeof(value), flags, out);
-        break;
-      }
-      case TRACE_TID:
-        print_value("tid", &t->rec_tid, sizeof(t->rec_tid), flags, out);
-        break;
-      case TRACE_TICKS: {
-        Ticks ticks = t->tick_count();
-        print_value("ticks", &ticks, sizeof(ticks), flags, out);
-        break;
-      }
-    }
-  }
-
-  fputc('\n', out);
-}
-
-static int find_gp_reg(const string& reg) {
-  for (int i = 0; i < 16; ++i) {
-    if (reg == gp_reg_names[i] || (i < 8 && reg == gp_reg_names_32[i])) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-static int find_seg_reg(const string& reg) {
-  for (int i = 0; i < 6; ++i) {
-    if (reg == seg_reg_names[i]) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-static bool parse_regs(const string& value, vector<TraceField>* out) {
-  string s = value;
-  if (s.size() == 0) {
-    fprintf(stderr, "Empty register list not allowed\n");
-    return false;
-  }
-  do {
-    size_t comma = s.find(',');
-    string reg;
-    if (comma == s.npos) {
-      reg = s;
-      s = "";
-    } else {
-      reg = s.substr(0, comma);
-      s = s.substr(comma + 1);
-    }
-    if (reg == "event") {
-      out->push_back({ TRACE_EVENT_NUMBER, 0 });
-    } else if (reg == "icount") {
-      out->push_back({ TRACE_INSTRUCTION_COUNT, 0 });
-    } else if (reg == "ip" || reg == "rip") {
-      out->push_back({ TRACE_IP, 0 });
-    } else if (reg == "fsbase") {
-      out->push_back({ TRACE_FSBASE, 0 });
-    } else if (reg == "gsbase") {
-      out->push_back({ TRACE_GSBASE, 0 });
-    } else if (reg == "flags" || reg == "rflags") {
-      out->push_back({ TRACE_FLAGS, 0 });
-    } else if (reg == "orig_rax" || reg == "orig_eax") {
-      out->push_back({ TRACE_ORIG_AX, 0 });
-    } else if (reg == "gp_x16") {
-      for (uint8_t i = 0; i < 16; ++i) {
-        out->push_back({ TRACE_GP_REG, i });
-      }
-    } else if (reg == "xmm_x16") {
-      for (uint8_t i = 0; i < 16; ++i) {
-        out->push_back({ TRACE_XMM_REG, i });
-      }
-    } else if (reg == "ymm_x16") {
-      for (uint8_t i = 0; i < 16; ++i) {
-        out->push_back({ TRACE_YMM_REG, i });
-      }
-    } else if (find_gp_reg(reg) >= 0) {
-      out->push_back({ TRACE_GP_REG, (uint8_t)find_gp_reg(reg) });
-    } else if (find_seg_reg(reg) >= 0) {
-      out->push_back({ TRACE_SEG_REG, (uint8_t)find_seg_reg(reg) });
-    } else if (reg == "xinuse") {
-      out->push_back({ TRACE_XINUSE, 0 });
-    } else if (reg == "fip") {
-      out->push_back({ TRACE_FIP, 0 });
-    } else if (reg == "mxcsr") {
-      out->push_back({ TRACE_MXCSR, 0});
-    } else if (reg == "tid") {
-      out->push_back({ TRACE_TID, 0 });
-    } else if (reg == "ticks") {
-      out->push_back({ TRACE_TICKS, 0 });
-    } else {
-      fprintf(stderr, "Unknown register '%s'\n", reg.c_str());
-      return false;
-    }
-  } while (s.size() > 0);
-  return true;
-}
 
 static bool parse_rerun_arg(vector<string>& args, RerunFlags& flags) {
   if (parse_global_option(args)) {
@@ -459,6 +102,8 @@ static bool parse_rerun_arg(vector<string>& args, RerunFlags& flags) {
   static const OptionSpec options[] = {
     { 1, "singlestep", HAS_PARAMETER },
     { 2, "event-regs", HAS_PARAMETER },
+    { 3, "export-checkpoints", HAS_PARAMETER },
+    { 4, "import-checkpoint", HAS_PARAMETER },
     { 'e', "trace-end", HAS_PARAMETER },
     { 'f', "function", HAS_PARAMETER },
     { 'r', "raw", NO_PARAMETER },
@@ -472,14 +117,22 @@ static bool parse_rerun_arg(vector<string>& args, RerunFlags& flags) {
 
   switch (opt.short_name) {
     case 1:
-      if (!parse_regs(opt.value, &flags.singlestep_trace)) {
+      if (!parse_trace_fields(opt.value, &flags.singlestep_trace)) {
         return false;
       }
       break;
     case 2:
-      if (!parse_regs(opt.value, &flags.event_trace)) {
+      if (!parse_trace_fields(opt.value, &flags.event_trace)) {
         return false;
       }
+      break;
+    case 3:
+      if (!parse_export_checkpoints(opt.value, flags.export_checkpoints_event, flags.export_checkpoints_count, flags.export_checkpoints_socket)) {
+        return false;
+      }
+      break;
+    case 4:
+      flags.import_checkpoint_socket = opt.value;
       break;
     case 'e':
       if (!opt.verify_valid_int(1, UINT32_MAX)) {
@@ -547,7 +200,7 @@ static const uint64_t sentinel_ret_address = 9;
 static void run_diversion_function(ReplaySession& replay, Task* task,
                                    const RerunFlags& flags) {
   DiversionSession::shr_ptr diversion_session = replay.clone_diversion();
-  Task* t = diversion_session->find_task(task->tuid());
+  ReplayTask* t = diversion_session->find_task(task->tuid())->as_replay();
   Registers regs = t->regs();
   // align stack
   auto sp = remote_ptr<uint64_t>(regs.sp().as_int() & ~uintptr_t(0xf)) - 1;
@@ -563,7 +216,7 @@ static void run_diversion_function(ReplaySession& replay, Task* task,
   while (true) {
     DiversionSession::DiversionResult result =
         diversion_session->diversion_step(t, cmd);
-    print_regs(t, 0, 0, flags, flags.singlestep_trace, stdout);
+    print_trace_fields(t, 0, 0, flags.raw, flags.singlestep_trace, stdout);
     if (result.break_status.signal) {
       if (result.break_status.signal->si_signo == SIGSEGV &&
           result.break_status.signal->si_addr == (void*)sentinel_ret_address) {
@@ -571,6 +224,11 @@ static void run_diversion_function(ReplaySession& replay, Task* task,
       }
       ASSERT(task, false) << "Unexpected signal "
                           << *result.break_status.signal;
+    }
+
+    if (result.status == DiversionSession::DiversionStatus::DIVERSION_EXITED) {
+        LOG(debug) << "DIVERSION_EXITED, breaking out of diversion_step() loop";
+        break;
     }
   }
 }
@@ -583,8 +241,35 @@ static ReplaySession::Flags session_flags(const RerunFlags& flags) {
   return result;
 }
 
-static int rerun(const string& trace_dir, const RerunFlags& flags) {
-  ReplaySession::shr_ptr replay_session = ReplaySession::create(trace_dir, session_flags(flags));
+static int rerun(const string& trace_dir, const RerunFlags& flags, CommandForCheckpoint& command_for_checkpoint) {
+  ScopedFd export_checkpoints_socket;
+  // Construct the listening socket immediately so importers can connect early and block without polling.
+  // If we need to import a checkpoint, we pass the socket in command_for_checkpoint.fds to the checkpoint
+  // exporter's child process.
+  if (flags.export_checkpoints_event) {
+    if (command_for_checkpoint.session) {
+      export_checkpoints_socket = std::move(command_for_checkpoint.fds.front());
+    } else {
+      export_checkpoints_socket = bind_export_checkpoints_socket(flags.export_checkpoints_count, flags.export_checkpoints_socket);
+    }
+  }
+
+  ReplaySession::shr_ptr replay_session;
+  if (command_for_checkpoint.session) {
+    replay_session = std::move(command_for_checkpoint.session);
+  } else if (flags.import_checkpoint_socket.empty()) {
+    replay_session = ReplaySession::create(trace_dir, session_flags(flags));
+    // Now that we've spawned the replay, raise our resource limits if
+    // possible.
+    raise_resource_limits();
+  } else {
+    vector<ScopedFd> fds;
+    if (export_checkpoints_socket.is_open()) {
+      fds.push_back(std::move(export_checkpoints_socket));
+    }
+    return invoke_checkpoint_command(flags.import_checkpoint_socket, command_for_checkpoint.args, std::move(fds));
+  }
+
   uint64_t instruction_count_within_event = 0;
   bool done_first_step = false;
   bool need_to_singlestep = !flags.singlestep_trace.empty();
@@ -594,14 +279,11 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
     }
   }
 
-  // Now that we've spawned the replay, raise our resource limits if
-  // possible.
-  raise_resource_limits();
-
   while (replay_session->trace_reader().time() < flags.trace_end) {
     RunCommand cmd = RUN_CONTINUE;
 
-    Task* old_task = replay_session->current_task();
+    auto old_task_p = replay_session->current_task();
+    ReplayTask* old_task = old_task_p ? old_task_p->as_replay() : nullptr;
     auto old_task_tuid = old_task ? old_task->tuid() : TaskUid();
     remote_code_ptr old_ip = old_task ? old_task->ip() : remote_code_ptr();
     FrameTime before_time = replay_session->trace_reader().time();
@@ -614,8 +296,8 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
         }
 
         done_first_step = true;
-        print_regs(old_task, before_time - 1, instruction_count_within_event,
-                   flags, flags.singlestep_trace, stdout);
+        print_trace_fields(old_task, before_time - 1, instruction_count_within_event,
+                           flags.raw, flags.singlestep_trace, stdout);
       }
 
       if (need_to_singlestep) {
@@ -634,7 +316,8 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
     if (cmd != RUN_CONTINUE) {
       // The old_task may have exited (and been deallocated) in the `replay_session->replay_step(cmd)` above.
       // So we need to try and obtain it from the session again to make sure it still exists.
-      Task* old_task = old_task_tuid.tid() ? replay_session->find_task(old_task_tuid) : nullptr;
+      Task* old_task_p = old_task_tuid.tid() ? replay_session->find_task(old_task_tuid) : nullptr;
+      ReplayTask* old_task = old_task_p ? old_task_p->as_replay() : nullptr;
       remote_code_ptr after_ip = old_task ? old_task->ip() : remote_code_ptr();
       DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
 
@@ -658,8 +341,8 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
           (singlestep_really_complete ||
            (before_time < after_time &&
             treat_event_completion_as_singlestep_complete(replayed_event)))) {
-        print_regs(old_task, before_time, instruction_count_within_event, flags,
-                   flags.singlestep_trace, stdout);
+        print_trace_fields(old_task, before_time, instruction_count_within_event,
+                           flags.raw, flags.singlestep_trace, stdout);
       }
 
       if (singlestep_really_complete) {
@@ -669,9 +352,16 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
     if (before_time < after_time) {
       LOG(debug) << "Completed event " << before_time
                  << " instruction_count=" << instruction_count_within_event;
-      print_regs(old_task, before_time, instruction_count_within_event, flags,
-                 flags.event_trace, stdout);
+      print_trace_fields(old_task, before_time, instruction_count_within_event,
+                         flags.raw, flags.event_trace, stdout);
       instruction_count_within_event = 1;
+    }
+
+    if (after_time == flags.export_checkpoints_event) {
+      command_for_checkpoint = export_checkpoints(std::move(replay_session),
+          flags.export_checkpoints_count,
+          export_checkpoints_socket, flags.export_checkpoints_socket);
+      return 0;
     }
   }
 
@@ -679,10 +369,12 @@ static int rerun(const string& trace_dir, const RerunFlags& flags) {
   return 0;
 }
 
-int RerunCommand::run(vector<string>& args) {
+int RerunCommand::run_internal(CommandForCheckpoint& command_for_checkpoint) {
+  // parse args first
   bool found_dir = false;
   string trace_dir;
   RerunFlags flags;
+  vector<string> args = command_for_checkpoint.args;
 
   while (!args.empty()) {
     if (parse_rerun_arg(args, flags)) {
@@ -711,7 +403,22 @@ int RerunCommand::run(vector<string>& args) {
     }
   }
 
-  return rerun(trace_dir, flags);
+  return rerun(trace_dir, flags, command_for_checkpoint);
+}
+
+int RerunCommand::run(vector<string>& args) {
+  CommandForCheckpoint command_for_checkpoint;
+  command_for_checkpoint.args = std::move(args);
+  while (true) {
+    ScopedFd exit_notification_fd = std::move(command_for_checkpoint.exit_notification_fd);
+    int ret = run_internal(command_for_checkpoint);
+    if (!command_for_checkpoint.session) {
+      if (exit_notification_fd.is_open()) {
+        notify_normal_exit(exit_notification_fd);
+      }
+      return ret;
+    }
+  }
 }
 
 } // namespace rr

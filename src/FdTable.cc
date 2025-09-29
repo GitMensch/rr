@@ -5,6 +5,7 @@
 #include <limits.h>
 
 #include <unordered_set>
+#include <utility>
 
 #include "rr/rr.h"
 
@@ -19,16 +20,53 @@ using namespace std;
 
 namespace rr {
 
+FdTable::shr_ptr FdTable::create(Task* t) {
+  shr_ptr fds(new FdTable(t->session().syscallbuf_fds_disabled_size()));
+  fds->insert_task(t);
+  return fds;
+}
+
+void FdTable::insert_task(Task* t) {
+  HasTaskSet::insert_task(t);
+  ++vms[t->vm().get()];
+}
+
+void FdTable::erase_task(Task* t) {
+  if (task_set().find(t) == task_set().end()) {
+    return;
+  }
+  HasTaskSet::erase_task(t);
+  auto it = vms.find(t->vm().get());
+  if (it == vms.end()) {
+    FATAL() << "Lost track of VM already?";
+  }
+  --it->second;
+  if (!it->second) {
+    vms.erase(it);
+  }
+}
+
 void FdTable::add_monitor(Task* t, int fd, FileMonitor* monitor) {
   // In the future we could support multiple monitors on an fd, but we don't
   // need to yet.
-  ASSERT(t, !is_monitoring(fd)) << "Task " << t->rec_tid
-    << " already monitoring fd " << fd;
-  if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(fd) == 0) {
+  FileMonitor* current = get_monitor(fd);
+  if (current) {
+    ASSERT(t, false) << "Task " << t->rec_tid << " already monitoring fd "
+      << fd << " " << file_monitor_type_name(current->type());
+  }
+  if (fd >= syscallbuf_fds_disabled_size && fds.count(fd) == 0) {
     fd_count_beyond_limit++;
   }
   fds[fd] = FileMonitor::shr_ptr(monitor);
   update_syscallbuf_fds_disabled(fd);
+}
+
+void FdTable::replace_monitor(Task* t, int fd, FileMonitor* monitor) {
+  if (!is_monitoring(fd)) {
+    add_monitor(t, fd, monitor);
+  } else {
+    fds[fd] = FileMonitor::shr_ptr(monitor);
+  }
 }
 
 bool FdTable::is_rr_fd(int fd) {
@@ -90,14 +128,14 @@ void FdTable::did_write(Task* t, int fd,
   }
 }
 
-void FdTable::did_dup(int from, int to) {
-  if (fds.count(from)) {
-    if (to >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(to) == 0) {
+void FdTable::did_dup(FdTable* table, int from, int to) {
+  if (table->fds.count(from)) {
+    if (to >= syscallbuf_fds_disabled_size && fds.count(to) == 0) {
       fd_count_beyond_limit++;
     }
-    fds[to] = fds[from];
+    fds[to] = table->fds[from];
   } else {
-    if (to >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(to) > 0) {
+    if (to >= syscallbuf_fds_disabled_size && fds.count(to) > 0) {
       fd_count_beyond_limit--;
     }
     fds.erase(to);
@@ -107,7 +145,7 @@ void FdTable::did_dup(int from, int to) {
 
 void FdTable::did_close(int fd) {
   LOG(debug) << "Close fd " << fd;
-  if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(fd) > 0) {
+  if (fd >= syscallbuf_fds_disabled_size && fds.count(fd) > 0) {
     fd_count_beyond_limit--;
   }
   fds.erase(fd);
@@ -122,7 +160,8 @@ FileMonitor* FdTable::get_monitor(int fd) {
   return it->second.get();
 }
 
-static syscallbuf_fd_classes join_fd_classes_over_tasks(AddressSpace* vm, int fd) {
+static syscallbuf_fd_classes join_fd_classes_over_tasks(AddressSpace* vm, int fd,
+    int syscallbuf_fds_disabled_size) {
   syscallbuf_fd_classes cls = FD_CLASS_UNTRACED;
   for (Task* t : vm->task_set()) {
     auto table = t->fd_table();
@@ -131,7 +170,7 @@ static syscallbuf_fd_classes join_fd_classes_over_tasks(AddressSpace* vm, int fd
         return FD_CLASS_TRACED;
       }
       cls = table->get_monitor(fd)->get_syscallbuf_class();
-    } else if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE - 1 &&
+    } else if (fd >= syscallbuf_fds_disabled_size - 1 &&
         table->count_beyond_limit() > 0) {
       return FD_CLASS_TRACED;
     }
@@ -143,31 +182,33 @@ void FdTable::update_syscallbuf_fds_disabled(int fd) {
   DEBUG_ASSERT(fd >= 0);
   DEBUG_ASSERT(task_set().size() > 0);
 
-  unordered_set<AddressSpace*> vms_updated;
   // It's possible for tasks with different VMs to share this fd table.
   // But tasks with the same VM might have different fd tables...
-  for (Task* t : task_set()) {
-    if (!t->session().is_recording()) {
-      return;
+  for (auto address_space : vms) {
+    RecordTask* rt = nullptr;
+    if (address_space.first->task_set().empty()) {
+      FATAL() << "Address space must have at least one task";
     }
-    RecordTask* rt = static_cast<RecordTask*>(t);
-    if (rt->already_exited()) {
-      continue;
-    }
-
-    AddressSpace* vm = rt->vm().get();
-    if (vms_updated.find(vm) != vms_updated.end()) {
-      continue;
-    }
-    vms_updated.insert(vm);
-
-    if (!rt->preload_globals.is_null()) {
-      if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE) {
-        fd = SYSCALLBUF_FDS_DISABLED_SIZE - 1;
+    for (Task* t : address_space.first->task_set()) {
+      if (!t->session().is_recording()) {
+        // We could return but we want to check that all our
+        // AddressSpaces have tasks (i.e. aren't dead/dangling)
+        break;
       }
-      char disable = (char)join_fd_classes_over_tasks(vm, fd);
+      rt = static_cast<RecordTask*>(t);
+      if (!rt->already_exited()) {
+        break;
+      }
+      rt = nullptr;
+    }
+    if (rt && !rt->preload_globals.is_null()) {
+      if (fd >= syscallbuf_fds_disabled_size) {
+        fd = syscallbuf_fds_disabled_size - 1;
+      }
+      char disable = (char)join_fd_classes_over_tasks(address_space.first, fd,
+          syscallbuf_fds_disabled_size);
       auto addr =
-          REMOTE_PTR_FIELD(t->preload_globals, syscallbuf_fd_class[0]) + fd;
+          REMOTE_PTR_FIELD(rt->preload_globals, syscallbuf_fd_class[0]) + fd;
       rt->write_mem(addr, disable);
       rt->record_local(addr, &disable);
     }
@@ -186,8 +227,8 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
     return;
   }
 
-  char disabled[SYSCALLBUF_FDS_DISABLED_SIZE];
-  memset(disabled, 0, sizeof(disabled));
+  vector<char> disabled;
+  disabled.resize(syscallbuf_fds_disabled_size, 0);
 
   // It's possible that some tasks in this address space have a different
   // FdTable. We need to disable syscallbuf for an fd if any tasks for this
@@ -196,8 +237,8 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
     for (auto& it : vm_t->fd_table()->fds) {
       int fd = it.first;
       DEBUG_ASSERT(fd >= 0);
-      if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE) {
-        fd = SYSCALLBUF_FDS_DISABLED_SIZE - 1;
+      if (fd >= syscallbuf_fds_disabled_size) {
+        fd = syscallbuf_fds_disabled_size - 1;
       }
       if (disabled[fd] == FD_CLASS_UNTRACED) {
         disabled[fd] = it.second->get_syscallbuf_class();
@@ -208,8 +249,8 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
   }
 
   auto addr = REMOTE_PTR_FIELD(t->preload_globals, syscallbuf_fd_class[0]);
-  rt->write_mem(addr, disabled, SYSCALLBUF_FDS_DISABLED_SIZE);
-  rt->record_local(addr, disabled, SYSCALLBUF_FDS_DISABLED_SIZE);
+  rt->write_mem(addr, disabled.data(), syscallbuf_fds_disabled_size);
+  rt->record_local(addr, disabled.data(), syscallbuf_fds_disabled_size);
 }
 
 void FdTable::close_after_exec(ReplayTask* t, const vector<int>& fds_to_close) {

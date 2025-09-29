@@ -5,7 +5,11 @@
 #define MAX_ERRNO 4095
 
 #define RR_PAGE_ADDR 0x70000000
+#ifdef __aarch64__
+#define RR_THREAD_LOCALS_PAGE_ADDR 0x70010000
+#else
 #define RR_THREAD_LOCALS_PAGE_ADDR 0x70001000
+#endif
 
 struct Unmaps {
   uintptr_t unmappings[1000];
@@ -79,6 +83,9 @@ __asm__("my_syscall:\n\t"
         "mov x3,x4\n\t"
         "mov x4,x5\n\t"
         "mov x5,x6\n\t"
+        "b 1f\n\t"
+        "mov x8, 0xdc\n"
+        "1:\n\t"
         "svc #0\n\t"
         "ret\n\t");
 #else

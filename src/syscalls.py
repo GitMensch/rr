@@ -7,7 +7,11 @@ class BaseSyscall(object):
     """
 
     # Take **kwargs and ignore to make life easier on RegularSyscall.
-    def __init__(self, x86=None, x64=None, generic=None, **kwargs):
+    def __init__(self, all=None, x86=None, x64=None, generic=None, **kwargs):
+        if all:
+            x86 = all
+            x64 = all
+            generic = all
         assert x86 or x64       # Must exist on one architecture.
         self.x86 = x86
         self.x64 = x64
@@ -120,6 +124,14 @@ open = IrregularEmulatedSyscall(x86=5, x64=2)
 # removed (regardless of the file descriptor that was used to obtain
 # the lock).
 close = IrregularEmulatedSyscall(x86=6, x64=3, generic=57)
+
+#  int close_range(unsigned int first, unsigned int last, unsigned int flags);
+#
+# The close_range() system call closes all open file descriptors
+# from first to last (included).
+#
+# Errors closing a given file descriptor are currently ignored.
+close_range = IrregularEmulatedSyscall(all=436)
 
 #  pid_t waitpid(pid_t pid, int *status, int options);
 #
@@ -304,7 +316,7 @@ prof = InvalidSyscall(x86=44)
 #  int brk(void *addr)
 #
 # brk() and sbrk() change the location of the program break, which
-# defines the end of the process's data segment (i.e., theprogram
+# defines the end of the process's data segment (i.e., the program
 # break is the first location after the end of the uninitialized data
 # segment).  Increasing the program break has the effect of
 # allocating memory to the process; decreasing the break deallocates
@@ -536,7 +548,7 @@ profil = InvalidSyscall(x86=98)
 # system.  path is the pathname of any file within the mounted file
 # system.  buf is a pointer to a statfs structure defined
 # approximately as follows:
-statfs = EmulatedSyscall(x86=99, x64=137, generic=43, arg2="struct Arch::statfs")
+statfs = EmulatedSyscall(x86=99, x64=137, generic=43, arg2="struct Arch::statfs_t")
 
 #  int fstatfs(int fd, struct statfs *buf)
 #
@@ -544,7 +556,7 @@ statfs = EmulatedSyscall(x86=99, x64=137, generic=43, arg2="struct Arch::statfs"
 # system.  path is the pathname of any file within the
 # get_time(GET_TID(thread_id));mounted file system.  buf is a pointer
 # to a statfs structure defined approximately as follows:
-fstatfs = EmulatedSyscall(x86=100, x64=138, generic=44, arg2="struct Arch::statfs")
+fstatfs = EmulatedSyscall(x86=100, x64=138, generic=44, arg2="struct Arch::statfs_t")
 
 ioperm = EmulatedSyscall(x86=101, x64=173)
 
@@ -556,7 +568,7 @@ ioperm = EmulatedSyscall(x86=101, x64=173)
 # through to the appropriate call.
 socketcall = IrregularEmulatedSyscall(x86=102)
 
-syslog = UnsupportedSyscall(x86=103, x64=103, generic=116)
+syslog = IrregularEmulatedSyscall(x86=103, x64=103, generic=116)
 
 #  int setitimer(int which, const struct itimerval *new_value, struct itimerval
 #*old_value);
@@ -566,9 +578,9 @@ syslog = UnsupportedSyscall(x86=103, x64=103, generic=116)
 # stored there.
 setitimer = EmulatedSyscall(x86=104, x64=38, generic=103, arg3="typename Arch::itimerval")
 getitimer = EmulatedSyscall(x86=105, x64=36, generic=102, arg2="typename Arch::itimerval")
-stat = EmulatedSyscall(x86=106, x64=4, arg2="struct Arch::stat")
-lstat = EmulatedSyscall(x86=107, x64=6, arg2="struct Arch::stat")
-fstat = EmulatedSyscall(x86=108, x64=5, generic=80, arg2="struct Arch::stat")
+stat = EmulatedSyscall(x86=106, x64=4, arg2="struct Arch::stat_t")
+lstat = EmulatedSyscall(x86=107, x64=6, arg2="struct Arch::stat_t")
+fstat = EmulatedSyscall(x86=108, x64=5, generic=80, arg2="struct Arch::stat_t")
 olduname = UnsupportedSyscall(x86=109)
 iopl = EmulatedSyscall(x86=110, x64=172)
 vhangup = UnsupportedSyscall(x86=111, x64=153, generic=58)
@@ -588,7 +600,7 @@ swapoff = UnsupportedSyscall(x86=115, x64=168, generic=225)
 #
 # sysinfo() provides a simple way of getting overall system
 # statistics.
-sysinfo = EmulatedSyscall(x86=116, x64=99, generic=179, arg1="struct Arch::sysinfo")
+sysinfo = EmulatedSyscall(x86=116, x64=99, generic=179, arg1="struct Arch::sysinfo_t")
 #  int ipc(unsigned int call, int first, int second, int third, void *ptr, long
 #fifth);
 #
@@ -984,20 +996,20 @@ ftruncate64 = EmulatedSyscall(x86=194)
 # int stat(const char *path, struct stat *buf);
 #
 # stat() stats the file pointed to by path and fills in buf.
-stat64 = EmulatedSyscall(x86=195, arg2="struct Arch::stat64")
+stat64 = EmulatedSyscall(x86=195, arg2="struct Arch::stat64_t")
 
 #  int lstat(const char *path, struct stat *buf);
 #
 # lstat() is identical to stat(), except that if path is a symbolic
 # link, then the link itself is stat-ed, not the file that it refers
 # to.
-lstat64 = EmulatedSyscall(x86=196, arg2="struct Arch::stat64")
+lstat64 = EmulatedSyscall(x86=196, arg2="struct Arch::stat64_t")
 
 #  int fstat(int fd, struct stat *buf)
 #
 # fstat() is identical to stat(), except that the file to be stat-ed
 # is specified by the file descriptor fd.
-fstat64 = EmulatedSyscall(x86=197, arg2="struct Arch::stat64")
+fstat64 = EmulatedSyscall(x86=197, arg2="struct Arch::stat64_t")
 
 lchown32 = EmulatedSyscall(x86=198)
 
@@ -1116,7 +1128,7 @@ fcntl64 = IrregularEmulatedSyscall(x86=221)
 # gettid() returns the caller's thread ID (TID).
 gettid = EmulatedSyscall(x86=224, x64=186, generic=178)
 
-#  ssize_t readahead(int fd, off64_t offset, size_t count);
+#  ssize_t readahead(int fd, off_t offset, size_t count);
 #
 # readahead() populates the page cache with data from a file so that
 # subsequent reads from that file will not block on disk I/O.  The fd
@@ -1157,7 +1169,7 @@ lremovexattr = EmulatedSyscall(x86=236, x64=198, generic=15)
 fremovexattr = EmulatedSyscall(x86=237, x64=199, generic=16)
 tkill = EmulatedSyscall(x86=238, x64=200, generic=130)
 
-# ssize_t sendfile64 (int __out_fd, int __in_fd, __off64_t *__offset, size_t
+# ssize_t sendfile64 (int __out_fd, int __in_fd, __off_t *__offset, size_t
 #__count);
 #
 # Send up to COUNT bytes from file associated with IN_FD starting at
@@ -1304,7 +1316,7 @@ timer_settime = EmulatedSyscall(x86=260, x64=223, generic=110, arg4="typename Ar
 timer_gettime = EmulatedSyscall(x86=261, x64=224, generic=108, arg2="typename Arch::itimerspec")
 timer_getoverrun = EmulatedSyscall(x86=262, x64=225, generic=109)
 timer_delete = EmulatedSyscall(x86=263, x64=226, generic=111)
-clock_settime = UnsupportedSyscall(x86=264, x64=227, generic=112)
+clock_settime = EmulatedSyscall(x86=264, x64=227, generic=112, arg2="typename Arch::timespec")
 
 #  int clock_gettime(clockid_t clk_id, struct timespec *tp);
 #
@@ -1333,9 +1345,9 @@ clock_nanosleep = IrregularEmulatedSyscall(x86=267, x64=230, generic=115)
 # approximately as follows...
 #
 # FIXME: we use arg3() here, although according to man pages this system
-# call has only 2 paramaters. However, strace tells another story...
-statfs64 = EmulatedSyscall(x86=268, arg3="struct Arch::statfs64")
-fstatfs64 = EmulatedSyscall(x86=269, arg3="struct Arch::statfs64")
+# call has only 2 parameters. However, strace tells another story...
+statfs64 = EmulatedSyscall(x86=268, arg3="struct Arch::statfs64_t")
+fstatfs64 = EmulatedSyscall(x86=269, arg3="struct Arch::statfs64_t")
 
 #  int tgkill(int tgid, int tid, int sig)
 #
@@ -1435,8 +1447,8 @@ futimesat = UnsupportedSyscall(x86=299, x64=261)
 # The fstatat() system call operates in exactly the same way as
 # stat(2), except for the differences described in this manual
 # page....
-fstatat = EmulatedSyscall(x64=262, generic=79, arg3="struct Arch::stat")
-fstatat64 = EmulatedSyscall(x86=300, arg3="struct Arch::stat64")
+fstatat = EmulatedSyscall(x64=262, generic=79, arg3="struct Arch::stat_t")
+fstatat64 = EmulatedSyscall(x86=300, arg3="struct Arch::stat64_t")
 
 #  int unlinkat(int dirfd, const char *pathname, int flags)
 #
@@ -1670,7 +1682,7 @@ memfd_create = IrregularEmulatedSyscall(x86=356, x64=319, generic=279)
 arch_prctl = IrregularEmulatedSyscall(x86=384, x64=158)
 
 bpf = IrregularEmulatedSyscall(x86=357, x64=321, generic=280)
-execveat = UnsupportedSyscall(x86=358, x64=322, generic=281)
+execveat = IrregularEmulatedSyscall(x86=358, x64=322, generic=281)
 userfaultfd = IrregularEmulatedSyscall(x86=374, x64=323, generic=282)
 membarrier = EmulatedSyscall(x86=375, x64=324, generic=283)
 mlock2 = UnsupportedSyscall(x86=376, x64=325, generic=284)
@@ -1685,7 +1697,7 @@ io_pgetevents = UnsupportedSyscall(x86=385, x64=333, generic=292)
 rseq = IrregularEmulatedSyscall(x86=386, x64=334, generic=293)
 
 clock_gettime64 = EmulatedSyscall(x86=403, arg2="typename Arch::Arch64::timespec")
-clock_settime64 = UnsupportedSyscall(x86=404)
+clock_settime64 = EmulatedSyscall(x86=404, arg2="typename Arch::Arch64::timespec")
 clock_adjtime64 = EmulatedSyscall(x86=405, arg2="typename Arch::Arch64::timex")
 clock_getres_time64 = EmulatedSyscall(x86=406, arg2="typename Arch::Arch64::timespec")
 clock_nanosleep_time64 = IrregularEmulatedSyscall(x86=407)
@@ -1706,44 +1718,66 @@ futex_time64 = IrregularEmulatedSyscall(x86=422)
 sched_rr_get_interval_time64 = UnsupportedSyscall(x86=423)
 
 # x86-64 decided to skip ahead here to catchup
-pidfd_send_signal = UnsupportedSyscall(x86=424, x64=424, generic=424)
-io_uring_setup = IrregularEmulatedSyscall(x86=425, x64=425, generic=425)
-io_uring_enter = UnsupportedSyscall(x86=426, x64=426, generic=426)
-io_uring_register = UnsupportedSyscall(x86=427, x64=427, generic=427)
-open_tree = UnsupportedSyscall(x86=428, x64=428, generic=428)
-move_mount = UnsupportedSyscall(x86=429, x64=429, generic=429)
-fsopen = UnsupportedSyscall(x86=430, x64=430, generic=430)
-fsconfig = UnsupportedSyscall(x86=431, x64=431, generic=431)
-fsmount = UnsupportedSyscall(x86=432, x64=432, generic=432)
-fspick = UnsupportedSyscall(x86=433, x64=433, generic=433)
-pidfd_open = EmulatedSyscall(x86=434, x64=434, generic=434)
-clone3 = IrregularEmulatedSyscall(x86=435, x64=435, generic=435)
-openat2 = UnsupportedSyscall(x86=437, x64=437, generic=437)
-pidfd_getfd = UnsupportedSyscall(x86=438, x64=438, generic=438)
-process_madvise = UnsupportedSyscall(x86=440, x64=440, generic=440)
-epoll_pwait2 = UnsupportedSyscall(x86=441, x64=441, generic=441)
-mount_setattr = UnsupportedSyscall(x86=442, x64=442, generic=442)
-quotactl_fd = UnsupportedSyscall(x86=443, x64=443, generic=443)
-landlock_create_ruleset = UnsupportedSyscall(x86=444, x64=444, generic=444)
-landlock_add_rule = UnsupportedSyscall(x86=445, x64=445, generic=445)
-landlock_restrict_self = UnsupportedSyscall(x86=446, x64=446, generic=446)
-memfd_secret = UnsupportedSyscall(x86=447, x64=447, generic=447)
+pidfd_send_signal = EmulatedSyscall(all=424)
+io_uring_setup = IrregularEmulatedSyscall(all=425)
+io_uring_enter = UnsupportedSyscall(all=426)
+io_uring_register = UnsupportedSyscall(all=427)
+open_tree = EmulatedSyscall(all=428)
+move_mount = EmulatedSyscall(all=429)
+fsopen = EmulatedSyscall(all=430)
+fsconfig = EmulatedSyscall(all=431)
+fsmount = EmulatedSyscall(all=432)
+fspick = UnsupportedSyscall(all=433)
+pidfd_open = EmulatedSyscall(all=434)
+clone3 = IrregularEmulatedSyscall(all=435)
+openat2 = IrregularEmulatedSyscall(all=437)
+pidfd_getfd = EmulatedSyscall(all=438)
+process_madvise = UnsupportedSyscall(all=440)
+epoll_pwait2 = IrregularEmulatedSyscall(all=441)
+mount_setattr = EmulatedSyscall(all=442)
+quotactl_fd = UnsupportedSyscall(all=443)
+landlock_create_ruleset = EmulatedSyscall(all=444)
+landlock_add_rule = EmulatedSyscall(all=445)
+landlock_restrict_self = EmulatedSyscall(all=446)
+memfd_secret = UnsupportedSyscall(all=447)
+process_mrelease = UnsupportedSyscall(all=448)
+futex_waitv = UnsupportedSyscall(all=449)
+set_mempolicy_home_node = UnsupportedSyscall(all=450)
+cachestat = UnsupportedSyscall(all=451)
+fchmodat2 = EmulatedSyscall(all=452)
+map_shadow_stack = UnsupportedSyscall(all=453)
+futex_wake = UnsupportedSyscall(all=454)
+futex_wait = UnsupportedSyscall(all=455)
+futex_requeue = UnsupportedSyscall(all=456)
+statmount = UnsupportedSyscall(all=457)
+listmount = UnsupportedSyscall(all=458)
+lsm_get_self_attr = UnsupportedSyscall(all=459)
+lsm_set_self_attr = UnsupportedSyscall(all=460)
+lsm_list_modules = UnsupportedSyscall(all=461)
+mseal = UnsupportedSyscall(all=462)
+setxattrat = UnsupportedSyscall(all=463)
+getxattrat = UnsupportedSyscall(all=464)
+listxattrat = UnsupportedSyscall(all=465)
+removexattrat = UnsupportedSyscall(all=466)
 
 # restart_syscall is a little special.
 restart_syscall = RestartSyscall(x86=0, x64=219, generic=128)
 
 # Internal rr syscall numbers.
 # These syscall numbers must be the same across all architectures.
-rrcall_init_preload = IrregularEmulatedSyscall(x86=1000, x64=1000, generic=1000)
-rrcall_init_buffers = IrregularEmulatedSyscall(x86=1001, x64=1001, generic=1001)
-rrcall_notify_syscall_hook_exit = IrregularEmulatedSyscall(x86=1002, x64=1002, generic=1002)
-rrcall_notify_control_msg = IrregularEmulatedSyscall(x86=1003, x64=1003, generic=1003)
-rrcall_reload_auxv = IrregularEmulatedSyscall(x86=1004, x64=1004, generic=1004)
-rrcall_mprotect_record = IrregularEmulatedSyscall(x86=1005, x64=1005, generic=1005)
-rrcall_notify_stap_semaphore_added = IrregularEmulatedSyscall(x86=1006, x64=1006, generic=1006)
-rrcall_notify_stap_semaphore_removed = IrregularEmulatedSyscall(x86=1007, x64=1007, generic=1007)
-rrcall_check_presence = IrregularEmulatedSyscall(x86=1008, x64=1008, generic=1008)
-rrcall_detach_teleport = IrregularEmulatedSyscall(x86=1009, x64=1009, generic=1009)
+rrcall_init_preload = IrregularEmulatedSyscall(all=1000)
+rrcall_init_buffers = IrregularEmulatedSyscall(all=1001)
+rrcall_notify_syscall_hook_exit = IrregularEmulatedSyscall(all=1002)
+rrcall_notify_control_msg = IrregularEmulatedSyscall(all=1003)
+rrcall_reload_auxv = IrregularEmulatedSyscall(all=1004)
+rrcall_mprotect_record = IrregularEmulatedSyscall(all=1005)
+rrcall_notify_stap_semaphore_added = IrregularEmulatedSyscall(all=1006)
+rrcall_notify_stap_semaphore_removed = IrregularEmulatedSyscall(all=1007)
+rrcall_check_presence = IrregularEmulatedSyscall(all=1008)
+rrcall_detach_teleport = IrregularEmulatedSyscall(all=1009)
+rrcall_arm_time_slice = IrregularEmulatedSyscall(all=1010)
+rrcall_freeze_tid = IrregularEmulatedSyscall(all=1011)
+rrcall_rdtsc = IrregularEmulatedSyscall(all=1012)
 
 # These syscalls also appear under `socketcall` on x86.
 socket = EmulatedSyscall(x86=359, x64=41, generic=198)

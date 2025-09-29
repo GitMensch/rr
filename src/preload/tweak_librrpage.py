@@ -8,8 +8,8 @@ import sys
 
 # How much space (and where) we reserved in the middle of the file for
 # the section header
-new_table_offset = 0x1000
-reserved_size = 0x1000
+new_table_offset = int(sys.argv[2])
+reserved_size = int(sys.argv[2])
 
 # Force this alignment for any sections
 sect_align = 0x10
@@ -85,7 +85,8 @@ with open(sys.argv[1], 'rb+') as f:
 	size = e_shentsize * e_shnum
 
 	assert size <= reserved_size
-	assert old_offset + size == os.stat(sys.argv[1]).st_size
+	file_size = os.stat(sys.argv[1]).st_size
+	assert old_offset + size == file_size
 
 	f.seek(old_offset)
 	data = f.read(size)
@@ -115,3 +116,12 @@ with open(sys.argv[1], 'rb+') as f:
 
 		alloc_offset = new_section_offset + sh_size
 		assert (alloc_offset - new_section_offset) <= reserved_size
+
+	# At replay time, Gdb may try to read the full image of the librrpage.so.
+	# If the runtime page size and the block size in librrpage.so does not agree
+	# the memory past the end of the first page of memory at 0x70000000 may not exist
+	# and it can cause gdb to not read any symbol for librrpage.so
+	# Simply make sure the file is long enough and the mapping is valid.
+	if file_size < 5 * reserved_size:
+		f.seek(file_size)
+		f.write(b'\0' * (5 * reserved_size - file_size))

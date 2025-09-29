@@ -87,6 +87,9 @@ templates = {
     'X86SyscallStubExtendedJump': AssemblyTemplate(
         # This code must match the stubs in syscall_hook.S.
         RawBytes(0x89, 0x25, 0x08, 0x10, 0x00, 0x70), # movl %esp,(stub_scratch_1)
+        RawBytes(0xBC, 0x12, 0x10, 0x00, 0x70),                   # mov $saved_flags+2,%esp
+        RawBytes(0x66, 0x9c),                                     # pushfw
+        RawBytes(0x8b, 0x25, 0x08, 0x10, 0x00, 0x70),             # movq (stub_scratch_1),%esp
         RawBytes(0xFF, 0x05, 0x0c, 0x10, 0x00, 0x70), # incl (alt_stack_nesting_level)
         RawBytes(0x83, 0x3c, 0x25, 0x0c, 0x10, 0x00, 0x70, 0x01), # cmpl 1,(alt_stack_nesting_level)
         RawBytes(0x75, 0x06),                                     # jne dont_switch
@@ -95,6 +98,25 @@ templates = {
         RawBytes(0xff, 0x35, 0x08, 0x10, 0x00, 0x70), # pushl (stub_scratch_1)
         RawBytes(0x68),                               # pushl $return_addr
         Field('return_addr', 4),
+        RawBytes(0xe9),                               # jmp $trampoline_relative_addr
+        Field('trampoline_relative_addr', 4)
+    ),
+    'X86TrapInstructionStubExtendedJump': AssemblyTemplate(
+        # This code must match the stubs in syscall_hook.S.
+        RawBytes(0x89, 0x25, 0x08, 0x10, 0x00, 0x70), # movl %esp,(stub_scratch_1)
+        RawBytes(0xBC, 0x12, 0x10, 0x00, 0x70),                   # mov $saved_flags+2,%esp
+        RawBytes(0x66, 0x9c),                                     # pushfw
+        RawBytes(0x8b, 0x25, 0x08, 0x10, 0x00, 0x70),             # movq (stub_scratch_1),%esp
+        RawBytes(0xFF, 0x05, 0x0c, 0x10, 0x00, 0x70), # incl (alt_stack_nesting_level)
+        RawBytes(0x83, 0x3c, 0x25, 0x0c, 0x10, 0x00, 0x70, 0x01), # cmpl 1,(alt_stack_nesting_level)
+        RawBytes(0x75, 0x06),                                     # jne dont_switch
+        RawBytes(0x8b, 0x25, 0x00, 0x10, 0x00, 0x70), # movl (syscallbuf_stub_alt_stack),%esp
+        # dont_switch:
+        RawBytes(0xff, 0x35, 0x08, 0x10, 0x00, 0x70), # pushl (stub_scratch_1)
+        RawBytes(0x68),                               # pushl $return_addr
+        Field('return_addr', 4),
+        RawBytes(0xb8),                               # movl $fake_syscall_no,%eax
+        Field('fake_syscall_no', 4),
         RawBytes(0xe9),                               # jmp $trampoline_relative_addr
         Field('trampoline_relative_addr', 4)
     ),
@@ -110,9 +132,16 @@ templates = {
         RawBytes(0xe9),         # jmp $relative_addr
         Field('relative_addr', 4),
     ),
+    'X64AbsoluteIndirectCallMonkeypatch': AssemblyTemplate(
+        RawBytes(0xff, 0x14, 0x25),     # call [absolute_addr]
+        Field('absolute_addr', 4),
+    ),
     'X64SyscallStubExtendedJump': AssemblyTemplate(
         # This code must match the stubs in syscall_hook.S.
         RawBytes(0x48, 0x89, 0x24, 0x25, 0x10, 0x10, 0x00, 0x70), # movq %rsp,(stub_scratch_1)
+        RawBytes(0xBC, 0x1e, 0x10, 0x00, 0x70),                   # mov $saved_flags+2,%esp
+        RawBytes(0x66, 0x9c),                                     # pushfw
+        RawBytes(0x48, 0x8b, 0x24, 0x25, 0x10, 0x10, 0x00, 0x70), # movq (stub_scratch_1),%rsp
         RawBytes(0xFF, 0x04, 0x25, 0x18, 0x10, 0x00, 0x70),       # incl (alt_stack_nesting_level)
         RawBytes(0x83, 0x3c, 0x25, 0x18, 0x10, 0x00, 0x70, 0x01), # cmpl 1,(alt_stack_nesting_level)
         RawBytes(0x75, 0x0a),                                     # jne dont_switch
@@ -122,11 +151,36 @@ templates = {
         RawBytes(0x48, 0x81, 0xec, 0x00, 0x01, 0x00, 0x00), # subq $256, %rsp
         # after adjust
         RawBytes(0xff, 0x34, 0x25, 0x10, 0x10, 0x00, 0x70), # pushq (stub_scratch_1)
-        RawBytes(0x50),                                     # pushq rax
+        RawBytes(0x50),                                     # pushq rax (just to make space for the next 2 instructions)
         RawBytes(0xc7, 0x04, 0x24),                         # movl $return_addr_lo,(%rsp)
         Field('return_addr_lo', 4),
         RawBytes(0xc7, 0x44, 0x24, 0x04),                   # movl $return_addr_hi,(%rsp+4)
         Field('return_addr_hi', 4),
+        RawBytes(0xff, 0x25, 0x00, 0x00, 0x00, 0x00),       # jmp *0(%rip)
+        Field('jump_target', 8),
+    ),
+    'X64TrapInstructionStubExtendedJump': AssemblyTemplate(
+        # This code must match the stubs in syscall_hook.S.
+        RawBytes(0x48, 0x89, 0x24, 0x25, 0x10, 0x10, 0x00, 0x70), # movq %rsp,(stub_scratch_1)
+        RawBytes(0xBC, 0x1e, 0x10, 0x00, 0x70),                   # mov $saved_flags+2,%esp
+        RawBytes(0x66, 0x9c),                                     # pushfw
+        RawBytes(0x48, 0x8b, 0x24, 0x25, 0x10, 0x10, 0x00, 0x70), # movq (stub_scratch_1),%rsp
+        RawBytes(0xFF, 0x04, 0x25, 0x18, 0x10, 0x00, 0x70),       # incl (alt_stack_nesting_level)
+        RawBytes(0x83, 0x3c, 0x25, 0x18, 0x10, 0x00, 0x70, 0x01), # cmpl 1,(alt_stack_nesting_level)
+        RawBytes(0x75, 0x0a),                                     # jne dont_switch
+        RawBytes(0x48, 0x8b, 0x24, 0x25, 0x00, 0x10, 0x00, 0x70), # movq (syscallbuf_stub_alt_stack),%rsp
+        RawBytes(0xeb, 0x07),                                     # jmp after_adjust
+        # dont_switch:
+        RawBytes(0x48, 0x81, 0xec, 0x00, 0x01, 0x00, 0x00), # subq $256, %rsp
+        # after adjust
+        RawBytes(0xff, 0x34, 0x25, 0x10, 0x10, 0x00, 0x70), # pushq (stub_scratch_1)
+        RawBytes(0x50),                                     # pushq rax (just to make space for the next 2 instructions)
+        RawBytes(0xc7, 0x04, 0x24),                         # movl $return_addr_lo,(%rsp)
+        Field('return_addr_lo', 4),
+        RawBytes(0xc7, 0x44, 0x24, 0x04),                   # movl $return_addr_hi,(%rsp+4)
+        Field('return_addr_hi', 4),
+        RawBytes(0xb8),                                     # movl $fake_syscall_no,%eax
+        Field('fake_syscall_no', 4),
         RawBytes(0xff, 0x25, 0x00, 0x00, 0x00, 0x00),       # jmp *0(%rip)
         Field('jump_target', 8),
     ),
@@ -143,18 +197,6 @@ templates = {
         RawBytes(0x53),                   # push %rbx
         RawBytes(0x48, 0x89, 0xe3),       # mov %rsp,%rbx
         RawBytes(0x48, 0x83, 0xe4, 0xc0), # and $0xffffffffffffffc0,%rsp
-    ),
-    'X64DLRuntimeResolvePrelude': AssemblyTemplate(
-        RawBytes(0xd9, 0x74, 0x24, 0xe0),                               # fstenv -32(%rsp)
-        RawBytes(0x48, 0xc7, 0x44, 0x24, 0xf4, 0x00, 0x00, 0x00, 0x00), # movq $0,-12(%rsp)
-        RawBytes(0xd9, 0x64, 0x24, 0xe0),                               # fldenv -32(%rsp)
-        RawBytes(0x48, 0x87, 0x1c, 0x24), # xchg (%rsp),%rbx
-        # r11 is destroyed anyways by _dl_runtime_resolve, so we can use it here.
-        RawBytes(0x49, 0x89, 0xdb),       # mov %rbx,%r11
-        RawBytes(0x48, 0x89, 0xe3),       # mov %rsp,%rbx
-        RawBytes(0x48, 0x83, 0xe4, 0xc0), # and $0xffffffffffffffc0,%rsp
-        RawBytes(0x41, 0x53),             # push %r11
-        RawBytes(0xc3),                   # ret
     ),
     'X64EndBr': AssemblyTemplate(
         RawBytes(0xf3, 0x0f, 0x1e, 0xfa)

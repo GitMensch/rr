@@ -14,8 +14,10 @@
 #include "GdbServer.h"
 #include "ReplaySession.h"
 #include "ScopedFd.h"
+#include "WaitManager.h"
 #include "core.h"
 #include "kernel_metadata.h"
+#include "launch_debugger.h"
 #include "log.h"
 #include "main.h"
 
@@ -34,6 +36,9 @@ ReplayCommand ReplayCommand::singleton(
     "<EVENT-NUM>\n"
     "                             in the trace.  See -M in the general "
     "options.\n"
+    "  -e, --goto-exit            start a debug server at the end of the "
+    "recording\n"
+    "                             or the end of the specified process.\n"
     "  -o, --debugger-option=<OPTION>\n"
     "                             pass <OPTION> to debugger\n"
     "  -p, --onprocess=<PID>|<COMMAND>\n"
@@ -65,7 +70,11 @@ ReplayCommand ReplayCommand::singleton(
     "                             to run on the CPU stored in the trace.\n"
     "                             Note that this may diverge from the recording\n"
     "                             in some cases.\n"
+    "  --intel-pt-start-checking-event   verify control flow using Intel PT\n"
+    "                             (used for debugging rr)\n"
     "  -x, --gdb-x=<FILE>         execute gdb commands from <FILE>\n"
+    "  --retry-transient-errors   If we detect a transient error that might resolve\n"
+    "                             by retrying, retry it\n"
     "  --stats=<N>                display brief stats every N steps (eg 10000).\n"
     "  --serve-files              Serve all files from the trace rather than\n"
     "                             assuming they exist on disk. Debugging will\n"
@@ -122,6 +131,8 @@ struct ReplayFlags {
   // to test the corresponding code.
   bool share_private_mappings;
 
+  bool retry_transient_errors;
+
   // When nonzero, display statistics every N steps.
   uint32_t dump_interval;
 
@@ -131,6 +142,8 @@ struct ReplayFlags {
 
   string tty;
 
+  FrameTime intel_pt_start_checking_event;
+
   ReplayFlags()
       : goto_event(0),
         singlestep_to_event(0),
@@ -138,14 +151,15 @@ struct ReplayFlags {
         process_created_how(CREATED_NONE),
         dont_launch_debugger(false),
         dbg_port(-1),
-        dbg_host(localhost_addr),
         keep_listening(false),
         gdb_binary_file_path("gdb"),
         redirect(true),
         cpu_unbound(false),
         share_private_mappings(false),
+        retry_transient_errors(false),
         dump_interval(0),
-        serve_files(false) {}
+        serve_files(false),
+        intel_pt_start_checking_event(-1) {}
 };
 
 static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
@@ -156,23 +170,26 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
   static const OptionSpec options[] = {
     { 'a', "autopilot", NO_PARAMETER },
     { 'd', "debugger", HAS_PARAMETER },
+    { 'e', "goto-exit", NO_PARAMETER },
     { 'k', "keep-listening", NO_PARAMETER },
     { 'f', "onfork", HAS_PARAMETER },
     { 'g', "goto", HAS_PARAMETER },
+    { 'i', "interpreter", HAS_PARAMETER },
     { 'o', "debugger-option", HAS_PARAMETER },
     { 'p', "onprocess", HAS_PARAMETER },
     { 'q', "no-redirect-output", NO_PARAMETER },
     { 'h', "dbghost", HAS_PARAMETER },
     { 's', "dbgport", HAS_PARAMETER },
     { 't', "trace", HAS_PARAMETER },
+    { 'u', "cpu-unbound", NO_PARAMETER },
     { 'x', "gdb-x", HAS_PARAMETER },
     { 0, "share-private-mappings", NO_PARAMETER },
     { 1, "fullname", NO_PARAMETER },
     { 2, "stats", HAS_PARAMETER },
     { 3, "serve-files", NO_PARAMETER },
     { 4, "tty", HAS_PARAMETER },
-    { 'u', "cpu-unbound", NO_PARAMETER },
-    { 'i', "interpreter", HAS_PARAMETER }
+    { 5, "intel-pt-start-checking-event", HAS_PARAMETER },
+    { 6, "retry-transient-errors", NO_PARAMETER }
   };
   ParsedOption opt;
   if (!Command::parse_option(args, options, &opt)) {
@@ -187,6 +204,9 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
     case 'd':
       flags.gdb_binary_file_path = opt.value;
       break;
+    case 'e':
+      flags.goto_event = -1;
+      break;
     case 'f':
       if (!opt.verify_valid_int(1, INT32_MAX)) {
         return false;
@@ -199,6 +219,10 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
         return false;
       }
       flags.goto_event = opt.int_value;
+      break;
+    case 'i':
+      flags.gdb_options.push_back("-i");
+      flags.gdb_options.push_back(opt.value);
       break;
     case 'k':
       flags.keep_listening = true;
@@ -237,6 +261,9 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       }
       flags.singlestep_to_event = opt.int_value;
       break;
+    case 'u':
+      flags.cpu_unbound = true;
+      break;
     case 'x':
       flags.gdb_options.push_back("-x");
       flags.gdb_options.push_back(opt.value);
@@ -259,12 +286,14 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
     case 4:
       flags.tty = opt.value;
       break;
-    case 'u':
-      flags.cpu_unbound = true;
+    case 5:
+      if (!opt.verify_valid_int(1, INT64_MAX)) {
+        return false;
+      }
+      flags.intel_pt_start_checking_event = opt.int_value;
       break;
-    case 'i':
-      flags.gdb_options.push_back("-i");
-      flags.gdb_options.push_back(opt.value);
+    case 6:
+      flags.retry_transient_errors = true;
       break;
     default:
       DEBUG_ASSERT(0 && "Unknown option");
@@ -330,12 +359,14 @@ static bool pid_execs(const string& trace_dir, pid_t pid) {
 // This needs to be global because it's used by a signal handler.
 static pid_t waiting_for_child;
 
-static ReplaySession::Flags session_flags(const ReplayFlags& flags) {
+static ReplaySession::Flags session_flags(const ReplayFlags& flags, bool can_retry_transient_errors) {
   ReplaySession::Flags result;
   result.redirect_stdio = flags.redirect;
   result.redirect_stdio_file = flags.tty;
   result.share_private_mappings = flags.share_private_mappings;
   result.cpu_unbound = flags.cpu_unbound;
+  result.intel_pt_start_checking_event = flags.intel_pt_start_checking_event;
+  result.transient_errors_fatal = !can_retry_transient_errors || !flags.retry_transient_errors;
   return result;
 }
 
@@ -346,12 +377,13 @@ static uint64_t to_microseconds(const struct timeval& tv) {
 static void serve_replay_no_debugger(const string& trace_dir,
                                      const ReplayFlags& flags) {
   ReplaySession::shr_ptr replay_session =
-    ReplaySession::create(trace_dir, session_flags(flags));
+    ReplaySession::create(trace_dir, session_flags(flags, true));
   uint32_t step_count = 0;
   struct timeval last_dump_time;
   double last_dump_rectime = 0;
   Session::Statistics last_stats;
   gettimeofday(&last_dump_time, NULL);
+  FrameTime printed_stdio_up_to_event = 0;
 
   while (true) {
     RunCommand cmd = RUN_CONTINUE;
@@ -359,7 +391,7 @@ static void serve_replay_no_debugger(const string& trace_dir,
         replay_session->trace_reader().time() >= flags.singlestep_to_event) {
       cmd = RUN_SINGLESTEP;
       fputs("Stepping from: ", stderr);
-      Task* t = replay_session->current_task();
+      ReplayTask* t = replay_session->current_task()->as_replay();
       t->regs().print_register_file_compact(stderr);
       fputc(' ', stderr);
       t->extra_regs().print_register_file_compact(stderr);
@@ -370,8 +402,23 @@ static void serve_replay_no_debugger(const string& trace_dir,
     auto result = replay_session->replay_step(cmd);
     FrameTime after_time = replay_session->trace_reader().time();
     DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
-    if (!last_dump_rectime)
+
+    if (result.status == REPLAY_TRANSIENT_ERROR) {
+      // Restart the replay from the beginning
+      LOG(warn) << "Transient error while replaying event "
+        << after_time << ", re-replaying execution from the beginning";
+      replay_session =
+        ReplaySession::create(trace_dir, session_flags(flags, true));
+      replay_session->set_suppress_stdio_before_event(printed_stdio_up_to_event + 1);
+      continue;
+    }
+
+    if (!last_dump_rectime) {
       last_dump_rectime = replay_session->trace_reader().recording_time();
+    }
+    if (after_time > before_time && before_time > printed_stdio_up_to_event) {
+      printed_stdio_up_to_event = before_time;
+    }
 
     ++step_count;
     if (flags.dump_interval > 0 && step_count % flags.dump_interval == 0) {
@@ -425,13 +472,20 @@ static void handle_SIGINT_in_parent(int sig) {
   // Just ignore it.
 }
 
-static GdbServer* server_ptr = nullptr;
+static volatile bool stop_replaying_to_target;
 
 static void handle_SIGINT_in_child(int sig) {
   DEBUG_ASSERT(sig == SIGINT);
-  if (server_ptr) {
-    server_ptr->interrupt_replay_to_target();
+  stop_replaying_to_target = true;
+}
+
+static DebuggerType identify_debugger(const string& debugger_name) {
+  string debugger_base_name = debugger_name;
+  base_name(debugger_base_name);
+  if (debugger_base_name.find("lldb") != string::npos) {
+    return DebuggerType::LLDB;
   }
+  return DebuggerType::GDB;
 }
 
 static int replay(const string& trace_dir, const ReplayFlags& flags) {
@@ -457,13 +511,17 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
     if (target.event == numeric_limits<decltype(target.event)>::max()) {
       serve_replay_no_debugger(trace_dir, flags);
     } else {
-      auto session = ReplaySession::create(trace_dir, session_flags(flags));
+      auto session = ReplaySession::create(trace_dir, session_flags(flags, false));
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
       conn_flags.dbg_host = flags.dbg_host;
       conn_flags.debugger_name = flags.gdb_binary_file_path;
       conn_flags.keep_listening = flags.keep_listening;
-      GdbServer(session, target).serve_replay(conn_flags);
+      conn_flags.serve_files = flags.serve_files;
+      // For now, assume the remote target is GDB-compatible. At some point
+      // we could add a flag to control this.
+      GdbServer::serve_replay(session, target, &stop_replaying_to_target,
+                              DebuggerType::GDB, conn_flags);
     }
 
     // Everything should have been cleaned up by now.
@@ -475,6 +533,7 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
   if (pipe2(debugger_params_pipe, O_CLOEXEC)) {
     FATAL() << "Couldn't open debugger params pipe.";
   }
+  DebuggerType debugger_type = identify_debugger(flags.gdb_binary_file_path);
   if (0 == (waiting_for_child = fork())) {
     // Ensure only the parent has the read end of the pipe open. Then if
     // the parent dies, our writes to the pipe will error out.
@@ -484,14 +543,18 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
       prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
 
       ScopedFd debugger_params_write_pipe(debugger_params_pipe[1]);
-      auto session = ReplaySession::create(trace_dir, session_flags(flags));
+      auto session = ReplaySession::create(trace_dir, session_flags(flags, false));
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
       conn_flags.dbg_host = flags.dbg_host;
       conn_flags.debugger_params_write_pipe = &debugger_params_write_pipe;
-      GdbServer server(session, target);
+      conn_flags.serve_files = flags.serve_files;
+      if (target.event == -1 && target.pid == 0) {
+        // If `replay -e` is specified without a pid, go to the exit
+        // of the first process (rather than the first exit of a process).
+        target.pid = session->trace_reader().peek_frame().tid();
+      }
 
-      server_ptr = &server;
       struct sigaction sa;
       memset(&sa, 0, sizeof(sa));
       sa.sa_flags = SA_RESTART;
@@ -500,7 +563,8 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
         FATAL() << "Couldn't set sigaction for SIGINT.";
       }
 
-      server.serve_replay(conn_flags);
+      GdbServer::serve_replay(session, target, &stop_replaying_to_target,
+                              debugger_type, conn_flags);
     }
     // Everything should have been cleaned up by now.
     check_for_leaks();
@@ -521,29 +585,21 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
 
   {
     ScopedFd params_pipe_read_fd(debugger_params_pipe[0]);
-    GdbServer::launch_gdb(params_pipe_read_fd, flags.gdb_binary_file_path,
-                          flags.gdb_options,
-                          flags.serve_files);
+    launch_debugger(params_pipe_read_fd, flags.gdb_binary_file_path,
+                    debugger_type, flags.gdb_options, flags.serve_files);
   }
 
   // Child must have died before we were able to get debugger parameters
   // and exec gdb. Exit with the exit status of the child.
   while (true) {
-    int status;
-    int ret = waitpid(waiting_for_child, &status, 0);
-    int err = errno;
-    LOG(debug) << getpid() << ": waitpid(" << waiting_for_child << ") returned "
-               << errno_name(err) << "(" << err << "); status:" << HEX(status);
-    if (waiting_for_child != ret) {
-      if (EINTR == err) {
-        continue;
-      }
-      FATAL() << getpid() << ": waitpid(" << waiting_for_child << ") failed";
+    WaitResult result = WaitManager::wait_exit(WaitOptions(waiting_for_child));
+    if (result.code != WAIT_OK) {
+      FATAL() << "Failed to wait for child " << waiting_for_child;
     }
-    if (WIFEXITED(status) || WIFSIGNALED(status)) {
-      LOG(info) << ("Debugger server died.  Exiting.");
-      exit(WIFEXITED(status) ? WEXITSTATUS(status) : 1);
-    }
+    LOG(debug) << getpid() << ": waitpid(" << waiting_for_child << ") returned status "
+               << result.status;
+    LOG(info) << "Debugger server died.  Exiting.";
+    exit(result.status.type() == WaitStatus::EXIT ? result.status.exit_code() : 1);
   }
 
   return 0;
@@ -596,6 +652,21 @@ int ReplayCommand::run(vector<string>& args) {
   }
   if (flags.dump_interval > 0 && !flags.dont_launch_debugger) {
     fprintf(stderr, "--stats requires -a\n");
+    print_help(stderr);
+    return 2;
+  }
+  if (flags.retry_transient_errors && flags.dump_interval) {
+    fprintf(stderr, "--retry-transient-errors is not compatible with --dump-interval");
+    print_help(stderr);
+    return 2;
+  }
+  if (flags.retry_transient_errors && flags.singlestep_to_event) {
+    fprintf(stderr, "--retry-transient-errors is not compatible with --singlestep-to-event");
+    print_help(stderr);
+    return 2;
+  }
+  if (flags.retry_transient_errors && !flags.dont_launch_debugger) {
+    fprintf(stderr, "--retry-transient-errors requires -a (for now)");
     print_help(stderr);
     return 2;
   }

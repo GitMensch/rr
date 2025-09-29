@@ -3,7 +3,9 @@
 #include "util.h"
 
 int main(void) {
-  atomic_puts("EXIT-SUCCESS");
+  signal(SIGTERM, SIG_IGN);
   kill(getppid(), SIGTERM);
+  atomic_puts("EXIT-SUCCESS");
+  sleep(10000);
   return 0;
 }

@@ -7,6 +7,6 @@ send_gdb('rc')
 expect_gdb('SIGTRAP')
 
 send_gdb('rc')
-expect_gdb('stopped')
+expect_history_end()
 
 ok()

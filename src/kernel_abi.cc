@@ -9,6 +9,7 @@
 #include <dirent.h>
 #include <elf.h>
 #include <fcntl.h>
+#include <linux/audit.h>
 #include <linux/capability.h>
 #include <linux/cdrom.h>
 #include <linux/ethtool.h>
@@ -32,7 +33,9 @@
 #include <linux/videodev2.h>
 #include <linux/vt.h>
 #include <linux/wireless.h>
+#include <mtd/mtd-user.h>
 #include <poll.h>
+#include <sched.h>
 #include <scsi/sg.h>
 #include <signal.h>
 #include <sound/asound.h>
@@ -106,6 +109,22 @@ CHECK_ELF(EM_X86_64 == EM::X86_64);
 
 CHECK_ELF(ELFDATA2LSB == ELFENDIAN::DATA2LSB);
 
+int to_audit_arch(SupportedArch arch) {
+  switch (arch) {
+    case x86:
+      return AUDIT_ARCH_I386;
+    case x86_64:
+      return AUDIT_ARCH_X86_64;
+#ifdef AUDIT_ARCH_AARCH64
+    case aarch64:
+      return AUDIT_ARCH_AARCH64;
+#endif
+    default:
+      FATAL() << "Unknown architecture";
+      return 0;
+  }
+}
+
 static const uint8_t int80_insn[] = { 0xcd, 0x80 };
 static const uint8_t sysenter_insn[] = { 0x0f, 0x34 };
 static const uint8_t syscall_insn[] = { 0x0f, 0x05 };
@@ -135,10 +154,20 @@ bool get_syscall_instruction_arch(Task* t, remote_code_ptr ptr,
     }
   }
 
-  bool read_ok = true;
-  vector<uint8_t> code = t->read_mem(ptr.to_data_ptr<uint8_t>(),
-    syscall_instruction_length(t->arch()), &read_ok);
-  if (!read_ok) {
+  if (!t->session().done_initial_exec()) {
+    // We're in rr, and all our syscalls are native.
+    *arch = NativeArch::arch();
+    return true;
+  }
+
+  if (!t->vm()->has_mapping(ptr.to_data_ptr<void>())) {
+    return false;
+  }
+
+  vector<uint8_t> code;
+  code.resize(syscall_instruction_length(t->arch()));
+  ssize_t bytes = t->read_bytes_fallible(ptr.to_data_ptr<void>(), code.size(), code.data());
+  if (bytes != (ssize_t)code.size()) {
     if (ok) {
       *ok = false;
     }
@@ -358,4 +387,21 @@ template <typename Arch> static size_t user_fpregs_struct_size_arch() {
 size_t user_fpregs_struct_size(SupportedArch arch) {
   RR_ARCH_FUNCTION(user_fpregs_struct_size_arch, arch)
 }
+
+template <typename Arch> static uint8_t virtual_address_size_arch(remote_ptr<void> ptr) {
+  return sizeof(typename Arch::unsigned_word) * 8 - Arch::clz_ptr(ptr);
+}
+
+uint8_t virtual_address_size(SupportedArch arch, remote_ptr<void> ptr) {
+  RR_ARCH_FUNCTION(virtual_address_size_arch, arch, ptr)
+}
+
+template <typename Arch> static uint8_t default_virtual_address_size_arch() {
+  return Arch::default_virtual_address_size;
+}
+
+uint8_t default_virtual_address_size(SupportedArch arch) {
+  RR_ARCH_FUNCTION(default_virtual_address_size_arch, arch)
+}
+
 }

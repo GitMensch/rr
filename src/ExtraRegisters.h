@@ -8,11 +8,13 @@
 
 #include <vector>
 
-#include "GdbRegister.h"
+#include "GdbServerRegister.h"
+#include "Registers.h"
 #include "kernel_abi.h"
 
 namespace rr {
 
+class ReplayTask;
 struct XSaveLayout;
 
 /**
@@ -22,12 +24,12 @@ struct XSaveLayout;
  * Task is responsible for creating meaningful values of this class.
  *
  * The only reason this class has an arch() is to enable us to
- * interpret GdbRegister.
+ * interpret GdbServerRegister.
  */
 class ExtraRegisters {
 public:
   // Create empty (uninitialized/unknown registers) value
-  ExtraRegisters(SupportedArch arch = SupportedArch(-1))
+  ExtraRegisters(SupportedArch arch = x86)
       : format_(NONE), arch_(arch) {}
   enum Format { NONE,
   /**
@@ -84,6 +86,11 @@ public:
   uint64_t read_fip(bool* defined) const;
 
   /**
+   * Read FOP field
+   */
+  uint16_t read_fop(bool* defined) const;
+
+  /**
    * Read MXCSR field
    */
   uint32_t read_mxcsr(bool* defined) const;
@@ -98,7 +105,13 @@ public:
    * Like |Registers::read_register()|, except attempts to read
    * the value of an "extra register" (floating point / vector).
    */
-  size_t read_register(uint8_t* buf, GdbRegister regno, bool* defined) const;
+  size_t read_register(uint8_t* buf, GdbServerRegister regno, bool* defined) const;
+
+  /**
+   * Like |Registers::write_register()|, except attempts to write
+   * the value of an "extra register" (floating point / vector).
+   */
+  bool write_register(GdbServerRegister regno, const void* value, size_t value_size);
 
   /**
    * Get a user_fpregs_struct for a particular Arch from these ExtraRegisters.
@@ -131,8 +144,34 @@ public:
 
   void validate(Task* t);
 
+  /**
+   * Return true if |reg1| matches |reg2|.  Passing EXPECT_MISMATCHES
+   * indicates that the caller is using this as a general register
+   * compare and nothing special should be done if the register files
+   * mismatch.  Passing LOG_MISMATCHES will log the registers that don't
+   * match.  Passing BAIL_ON_MISMATCH will additionally abort on
+   * mismatch.
+   * This is conservative; we only return false if we have enough
+   * information to verify that the registers definitely don't match.
+   * The register files must have the same arch.
+   */
+  Registers::Comparison compare_with(const ExtraRegisters& reg2) const {
+    Registers::Comparison result;
+    compare_internal(reg2, result);
+    return result;
+  }
+
+  bool matches(const ExtraRegisters& reg2) const {
+    Registers::Comparison result;
+    result.store_mismatches = false;
+    compare_internal(reg2, result);
+    return !result.mismatch_count;
+  }
+
 private:
   friend class Task;
+
+  void compare_internal(const ExtraRegisters& reg2, Registers::Comparison& result) const;
 
   Format format_;
   SupportedArch arch_;

@@ -6,21 +6,24 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
+#include "AddressSpace.h"
 #include "DiversionSession.h"
-#include "GdbConnection.h"
+#include "GdbServerConnection.h"
 #include "ReplaySession.h"
 #include "ReplayTimeline.h"
 #include "ScopedFd.h"
+#ifdef PROC_SERVICE_H
 #include "ThreadDb.h"
+#endif
 #include "TraceFrame.h"
 
 namespace rr {
 
-static std::string localhost_addr = "127.0.0.1";
-
 class GdbServer {
-  // Not ideal but we can't inherit friend from GdbCommand
+  // Not ideal but we can't inherit friend from DebuggerExtensionCommand
   friend std::string invoke_checkpoint(GdbServer&, Task*,
                                        const std::vector<std::string>&);
   friend std::string invoke_delete_checkpoint(GdbServer&, Task*,
@@ -46,6 +49,7 @@ public:
     int dbg_port;
     std::string dbg_host;
     bool keep_listening;
+    bool serve_files;
     // If non-null, then when the gdbserver is set up, we write its connection
     // parameters through this pipe. GdbServer::launch_gdb is passed the
     // other end of this pipe to exec gdb with the parameters.
@@ -54,79 +58,45 @@ public:
     // is null.
     std::string debugger_name;
 
-    ConnectionFlags()
-        : dbg_port(-1),
-          dbg_host(localhost_addr),
-          keep_listening(false),
-          debugger_params_write_pipe(nullptr) {}
+    ConnectionFlags();
   };
 
   /**
-   * Create a gdbserver serving the replay of 'session'.
+   * Serve the replay of 'session'.
+   * When `stop_replaying_to_target` is non-null, setting it to true
+   * (e.g. in a signal handler) will interrupt the replay.
+   * Returns only when the debugger disconnects.
    */
-  GdbServer(std::shared_ptr<ReplaySession> session, const Target& target)
-      : target(target),
-        final_event(UINT32_MAX),
-        in_debuggee_end_state(false),
-        stop_replaying_to_target(false),
-        interrupt_pending(false),
-        timeline(std::move(session)),
-        emergency_debug_session(nullptr) {
-    memset(&stop_siginfo, 0, sizeof(stop_siginfo));
-  }
-
-  /**
-   * Actually run the server. Returns only when the debugger disconnects.
-   */
-  void serve_replay(const ConnectionFlags& flags);
-
-  /**
-   * exec()'s gdb using parameters read from params_pipe_fd (and sent through
-   * the pipe passed to serve_replay_with_debugger).
-   */
-  static void launch_gdb(ScopedFd& params_pipe_fd,
-                         const std::string& gdb_binary_file_path,
-                         const std::vector<std::string>& gdb_options,
-                         bool serve_files);
-
-  /**
-   * Start a debugging connection for |t| and return when there are no
-   * more requests to process (usually because the debugger detaches).
-   *
-   * This helper doesn't attempt to determine whether blocking rr on a
-   * debugger connection might be a bad idea.  It will always open the debug
-   * socket and block awaiting a connection.
-   */
-  static void emergency_debug(Task* t);
-
-  /**
-   * A string containing the default gdbinit script that we load into gdb.
-   */
-  static std::string init_script();
-
-  /**
-   * Called from a signal handler (or other thread) during serve_replay,
-   * this will cause the replay-to-target phase to be interrupted and
-   * debugging started wherever the replay happens to be.
-   */
-  void interrupt_replay_to_target() { stop_replaying_to_target = true; }
+  static void serve_replay(std::shared_ptr<ReplaySession> session,
+                           const Target& target,
+                           volatile bool* stop_replaying_to_target,
+                           DebuggerType debugger_type,
+                           const ConnectionFlags& flags);
 
   /**
    * Return the register |which|, which may not have a defined value.
    */
-  static GdbRegisterValue get_reg(const Registers& regs,
+  static GdbServerRegisterValue get_reg(const Registers& regs,
                                   const ExtraRegisters& extra_regs,
-                                  GdbRegister which);
+                                  GdbServerRegister which);
 
-  ReplayTimeline& get_timeline() { return timeline; }
+  // Null if this is an emergency debug session.
+  ReplayTimeline* timeline() { return timeline_; }
+
+  static void serve_emergency_debugger(
+        std::unique_ptr<GdbServerConnection> dbg, Task* t) {
+    GdbServer(dbg, t, nullptr, Target()).process_debugger_requests();
+  }
 
 private:
-  GdbServer(std::unique_ptr<GdbConnection>& dbg, Task* t);
+  GdbServer(std::unique_ptr<GdbServerConnection>& connection, Task* t,
+            ReplayTimeline* timeline, const Target& target);
 
   Session& current_session() {
-    return timeline.is_running() ? timeline.current_session()
-                                 : *emergency_debug_session;
+    return timeline_ ? timeline_->current_session() :
+        *emergency_debug_session;
   }
+  ReplayTask* require_timeline_current_task();
 
   void dispatch_regs_request(const Registers& regs,
                              const ExtraRegisters& extra_regs);
@@ -142,7 +112,6 @@ private:
    */
   void dispatch_debugger_request(Session& session, const GdbRequest& req,
                                  ReportState state);
-  bool at_target();
   void activate_debugger();
   void restart_session(const GdbRequest& req);
   GdbRequest process_debugger_requests(ReportState state = REPORT_NORMAL);
@@ -189,19 +158,19 @@ private:
    * If |break_status| indicates a stop that we should report to gdb,
    * report it. |req| is the resume request that generated the stop.
    */
-  void maybe_notify_stop(const GdbRequest& req,
+  void maybe_notify_stop(const Session& session,
+                         const GdbRequest& req,
                          const BreakStatus& break_status);
+
+  void notify_stop_internal(const Session& session,
+                            ExtendedTaskId which, int sig,
+                            const std::string& reason = std::string());
 
   /**
    * Return the checkpoint stored as |checkpoint_id| or nullptr if there
    * isn't one.
    */
   ReplaySession::shr_ptr get_checkpoint(int checkpoint_id);
-  /**
-   * Delete the checkpoint stored as |checkpoint_id| if it exists, or do
-   * nothing if it doesn't exist.
-   */
-  void delete_checkpoint(int checkpoint_id);
 
   /**
    * Handle GDB file open requests. If we can serve this read request, add
@@ -210,38 +179,93 @@ private:
    */
   int open_file(Session& session, Task *continue_task, const std::string& file_name);
 
-  Target target;
-  // dbg is initially null. Once the debugger connection is established, it
-  // never changes.
-  std::unique_ptr<GdbConnection> dbg;
-  // When dbg is non-null, the ThreadGroupUid of the task being debugged. Never
-  // changes once the connection is established --- we don't currently
-  // support switching gdb between debuggee processes.
+  /**
+   * Allocates debugger-owned memory region.
+   * We pretend this memory exists in all sessions, but it actually only
+   * exists in diversion sessions. When there is no diversion session,
+   * we divert reads and writes to it to our internal storage.
+   * During a diversion, the diversion session is the source of truth
+   * and all reads and writes should go directly to the session.
+   * If the diversion exits normally we update the memory values from
+   * the diversion session, but if it crashes, we don't.
+   */
+  remote_ptr<void> allocate_debugger_mem(ThreadGroupUid tguid,
+                                         size_t size, int prot);
+  /**
+   * Frees a debugger-owned memory region. Returns 0
+   * if there is no such region, otherwise returns the size
+   * of the freed region.
+   */
+  size_t free_debugger_mem(ThreadGroupUid tguid, remote_ptr<void> addr);
+  // If the address is in debugger memory, return its size and prot and
+  // return true.
+  // Otherwise returns false.
+  bool debugger_mem_region(ThreadGroupUid tguid, remote_ptr<void> addr, int* prot,
+                           MemoryRange* mem_range);
+  // Read from debugger memory. Returns false if the range is not in debugger memory.
+  // Fatal error if the range partially overlaps debugger memory.
+  // Don't call this if the session is a diversion, read from the diversion directly
+  // since it has the values.
+  bool read_debugger_mem(ThreadGroupUid tguid, MemoryRange range, uint8_t* values);
+  // Write to debugger memory. Returns false if the range is not in debugger memory.
+  // Fatal error if the range partially overlaps debugger memory.
+  // Don't call this if the session is a diversion, write to the diversion directly
+  // since it has the values.
+  bool write_debugger_mem(ThreadGroupUid tguid, MemoryRange range, const uint8_t* values);
+  // Add mappings of the debugger memory to the session.
+  // If `addr` is null then all mappings are added, otherwise only mappings
+  // at that address are added.
+  void map_debugger_mem(DiversionSession& session, ThreadGroupUid tguid,
+                        remote_ptr<void> addr);
+  // Unmap mapping of a specific debugger memory region from the session.
+  void unmap_debugger_mem(DiversionSession& session,
+                          ThreadGroupUid tguid, remote_ptr<void> addr,
+                          size_t size);
+  // Read back the contents of all debugger memory regions from the session.
+  void read_back_debugger_mem(DiversionSession& session);
+
+  // Get the last GdbServerRegister for "this" arch. If it hasn't be determined, configure it.
+  const vector<GdbServerRegister>& target_registers(SupportedArch arch);
+
+  // dbg is never null.
+  std::unique_ptr<GdbServerConnection> dbg;
+  // The ThreadGroupUid of the task being debugged.
+  // This should really not be needed and should go away so we can debug
+  // multiple processes.
   ThreadGroupUid debuggee_tguid;
+  // What we were trying to reach.
+  Target target;
   // ThreadDb for debuggee ThreadGroup
+#ifdef PROC_SERVICE_H
   std::unique_ptr<ThreadDb> thread_db;
-  // The TaskUid of the last continued task.
-  TaskUid last_continue_tuid;
-  // The TaskUid of the last queried task.
-  TaskUid last_query_tuid;
+#endif
+  // The last continued task.
+  ExtendedTaskId last_continue_task;
+  // The last queried task.
+  ExtendedTaskId last_query_task;
   FrameTime final_event;
   // siginfo for last notified stop.
   siginfo_t stop_siginfo;
   bool in_debuggee_end_state;
-  // True when the user has interrupted replaying to a target event.
-  volatile bool stop_replaying_to_target;
+  // True when a restart was attempted but didn't succeed.
+  bool failed_restart;
+  // Set to true when the user has interrupted replaying to a target event.
+  volatile bool* stop_replaying_to_target;
   // True when a DREQ_INTERRUPT has been received but not handled, or when
   // we've restarted and want the first continue to be interrupted immediately.
   bool interrupt_pending;
+  // True when a user has run to exit before attaching the debugger.
+  bool exit_sigkill_pending;
 
-  ReplayTimeline timeline;
+  // Exactly one of the following two pointers is null.
+  ReplayTimeline* timeline_;
   Session* emergency_debug_session;
 
   struct Checkpoint {
     enum Explicit { EXPLICIT, NOT_EXPLICIT };
-    Checkpoint(ReplayTimeline& timeline, TaskUid last_continue_tuid, Explicit e,
+    Checkpoint(ReplayTimeline& timeline, ExtendedTaskId last_continue_task, Explicit e,
                const std::string& where)
-        : last_continue_tuid(last_continue_tuid), is_explicit(e), where(where) {
+        : last_continue_task(last_continue_task), is_explicit(e), where(where) {
       if (e == EXPLICIT) {
         mark = timeline.add_explicit_checkpoint();
       } else {
@@ -250,7 +274,7 @@ private:
     }
     Checkpoint() : is_explicit(NOT_EXPLICIT) {}
     ReplayTimeline::Mark mark;
-    TaskUid last_continue_tuid;
+    ExtendedTaskId last_continue_task;
     Explicit is_explicit;
     std::string where;
   };
@@ -273,6 +297,30 @@ private:
   std::map<int, FileId> memory_files;
   // The pid for gdb's last vFile:setfs
   pid_t file_scope_pid;
+
+  // LLDB wants to allocate memory in tracees. Instead of modifying tracee ReplaySessions,
+  // we store the memory outside the session and copy it into DiversionSessions as needed.
+  struct DebuggerMemRegion {
+    std::vector<uint8_t> values;
+    int prot;
+  };
+  struct DebuggerMem {
+    std::map<MemoryRange, DebuggerMemRegion, MappingComparator> regions;
+    // Virtual memory ranges that are never used by any tracee, also excluding
+    // memory used by debugger_mem and guard pages.
+    ReplaySession::MemoryRanges free_memory;
+    bool did_get_accurate_free_memory;
+  };
+  // Maps from tgid to the DebuggerMem.
+  std::unordered_map<ThreadGroupUid, DebuggerMem> debugger_mem;
+
+  struct SavedRegisters {
+    Registers regs;
+    ExtraRegisters extra_regs;
+  };
+  std::unordered_map<int, SavedRegisters> saved_register_states;
+
+  vector<GdbServerRegister> register_description;
 };
 
 } // namespace rr

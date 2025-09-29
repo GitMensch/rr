@@ -71,6 +71,7 @@ public:
 struct SectionOffsets {
   uint64_t start;
   uint64_t end;
+  bool compressed;
 };
 
 class ElfReader {
@@ -100,17 +101,19 @@ public:
   Debuglink read_debuglink();
   Debugaltlink read_debugaltlink();
   std::string read_buildid();
+  std::string read_interp();
   // Returns true and sets file |offset| if ELF address |addr| is mapped from
   // a section in the ELF file.  Returns false if no section maps to
   // |addr|.  |addr| is an address indicated by the ELF file, not its
   // relocated address in memory.
   bool addr_to_offset(uintptr_t addr, uintptr_t& offset);
   SectionOffsets find_section_file_offsets(const char* name);
-  DwarfSpan dwarf_section(const char* name);
+  DwarfSpan dwarf_section(const char* name, bool known_to_be_compressed = false);
+  SupportedArch arch() const { return arch_; }
 private:
   ElfReaderImplBase& impl();
   std::unique_ptr<ElfReaderImplBase> impl_;
-  SupportedArch arch;
+  SupportedArch arch_;
 protected:
   uint8_t* map;
   size_t size;

@@ -1,4 +1,8 @@
+import os
 from util import *
+
+send_gdb('when')
+expect_gdb('Completed event: %s'%os.environ['EVENTS'])
 
 send_gdb('b first_breakpoint')
 expect_gdb('Breakpoint 1')

@@ -9,20 +9,37 @@
 
 #include <signal.h>
 #include <stdint.h>
+#include <linux/perf_event.h>
 #include <sys/types.h>
 
+#include <memory>
+#include <utility>
+#include <vector>
+
+#include "CPUs.h"
+#include "PerfCounterBuffers.h"
 #include "ScopedFd.h"
 #include "Ticks.h"
 
-struct perf_event_attr;
-
 namespace rr {
 
+class Registers;
 class Task;
+class BpfAccelerator;
 
 enum TicksSemantics {
   TICKS_RETIRED_CONDITIONAL_BRANCHES,
   TICKS_TAKEN_BRANCHES,
+};
+
+/**
+ * A buffer of Intel PT control-flow data.
+ */
+struct PTData {
+  PTData() {}
+  explicit PTData(std::vector<std::vector<uint8_t>> data)
+    : data(std::move(data)) {}
+  std::vector<std::vector<uint8_t>> data;
 };
 
 /**
@@ -33,17 +50,39 @@ enum TicksSemantics {
  * for progress, which we call "ticks". Currently this is the count of retired
  * conditional branches. We support dispatching a signal when the counter
  * reaches a particular value.
- *
- * When extra_perf_counters_enabled() returns true, we monitor additional
- * counters of interest.
  */
 class PerfCounters {
 public:
   /**
    * Create performance counters monitoring the given task.
+   * When enable is false, we always report 0 and don't do any interrupts.
    */
-  PerfCounters(pid_t tid, TicksSemantics ticks_semantics);
-  ~PerfCounters() { stop(); }
+  enum Enabled {
+    ENABLE,
+    DISABLE
+  };
+  enum IntelPTEnabled {
+    PT_DISABLE,
+    PT_ENABLE
+  };
+  // `cpu_binding` must be `UNBOUND` or `SPECIFIED_CORE`.
+  PerfCounters(pid_t tid, BindCPU cpu_binding, TicksSemantics ticks_semantics,
+               Enabled enabled, IntelPTEnabled enable_pt);
+  ~PerfCounters() { close(); }
+
+  struct PTState {
+    PTData pt_data;
+    ScopedFd pt_perf_event_fd;
+    PerfCounterBuffers perf_buffers;
+
+    PTState() {}
+    ~PTState() { close(); }
+
+    void open(pid_t tid);
+    // Returns number of bytes flushed
+    size_t flush();
+    void close();
+  };
 
   void set_tid(pid_t tid);
 
@@ -53,41 +92,53 @@ public:
    * the hardware triggers its interrupt some time after that. We also allow
    * the interrupt to fire early.)
    * This must be called while the task is stopped, and it must be called
-   * before the task is allowed to run again.
+   * before the task is allowed to run again if it's going to trigger ticks.
    * `ticks_period` of zero means don't interrupt at all.
+   * Opens all relevant fds if necessary.
    */
-  void reset(Ticks ticks_period);
+  void start(Task* t, Ticks ticks_period);
 
-  template <typename Arch>
-  void reset_arch_extras();
+  enum class Error {
+    // Everything ok
+    None,
+    // A transient error was detected. Retrying might succeed.
+    Transient,
+  };
 
   /**
-   * Close the perfcounter fds. They will be automatically reopened if/when
-   * reset is called again.
+   * Suspend counting until the next start.
+   * Returns the current value of the ticks counter.
+   * `t` is used for debugging purposes.
+   * If `error` is non-null,`*error` will be set to `Error::Transient`
+   * if a transient error is detected, otherwise `Error::None`.
+   * If `error` is null and a transient error is detected, it will be
+   * treated as fatal.
    */
-  void stop();
+  Ticks stop(Task* t, Error* error = nullptr);
 
   /**
-   * Suspend counting until the next reset. This may or may not actually stop
-   * the performance counters, depending on whether or not this is required
-   * for correctness on this kernel version.
+   * Close the perfcounter fds (if open). They will be automatically reopened if/when
+   * reset is called again. The counters must not be currently running.
    */
-  void stop_counting();
+  void close();
 
   /**
    * Return the number of ticks we need for an emulated branch.
    */
   static Ticks ticks_for_unconditional_indirect_branch(Task*);
   /**
+   * Return the number of ticks we need for an emulated direct branch.
+   */
+  static Ticks ticks_for_unconditional_direct_branch(Task*);
+  /**
    * Return the number of ticks we need for a direct call.
    */
   static Ticks ticks_for_direct_call(Task*);
 
   /**
-   * Read the current value of the ticks counter.
-   * `t` is used for debugging purposes.
+   * Whether PMU on core i is supported.
    */
-  Ticks read_ticks(Task* t);
+  static bool support_cpu(int cpu);
 
   /**
    * Returns what ticks mean for these counters.
@@ -113,19 +164,65 @@ public:
    * When an interrupt is requested, at most this many ticks may elapse before
    * the interrupt is delivered.
    */
-  static uint32_t skid_size();
+  uint32_t skid_size();
+
+  /**
+   * If Intel PT data collection is on, returns the accumulated raw PT data
+   * and clears the internal buffer.
+   * Otherwise returns an empty buffer.
+   */
+  PTData extract_intel_pt_data();
+
+  /**
+   * Start the PT copy thread. We need to do this early, before CPU binding
+   * has occurred.
+   */
+  static void start_pt_copy_thread();
+
+  /**
+   * Returns true iff we detected issues with performance counter configuration
+   * and wanted to die but the user forced continuation.
+   */
+  static bool improperly_configured();
+
+  /**
+   * Try to use BPF to accelerate async signal processing
+   */
+#ifdef BPF
+  bool accelerate_async_signal(const Registers& regs);
+  uint64_t bpf_skips() const;
+#else
+  bool accelerate_async_signal(const Registers&) {
+    return false;
+  }
+  uint64_t bpf_skips() const {
+    return 0;
+  }
+#endif
+
+private:
+  template <typename Arch> void reset_arch_extras(int pmu_index);
 
   /**
    * Use a separate skid_size for recording since we seem to see more skid
    * in practice during recording, in particular during the
    * async_signal_syscalls tests
    */
-  static uint32_t recording_skid_size() { return skid_size() * 5; }
+  uint32_t recording_skid_size() { return skid_size() * 5; }
 
-private:
+  /**
+   * If `error` is non-null,`*error` will be set to `Error::Transient`
+   * if a transient error is detected, otherwise `Error::None`.
+   * If `error` is null and a transient error is detected, it will be
+   * treated as fatal.
+   */
+  Ticks read_ticks(Task* t, Error* error);
+
   // Only valid while 'counting' is true
   Ticks counting_period;
   pid_t tid;
+  // Either 0 or the cpu index. Used to index into `perf_attrs`.
+  int pmu_index;
   // We use separate fds for counting ticks and for generating interrupts. The
   // former ignores ticks in aborted transactions, and does not support
   // sample_period; the latter does not ignore ticks in aborted transactions,
@@ -141,8 +238,16 @@ private:
   // aarch64 specific counter to detect use of ll/sc instructions
   ScopedFd fd_strex_counter;
 
+  // BPF-enabled hardware breakpoint for fast async signal emulation.
+  ScopedFd fd_async_signal_accelerator;
+
+  std::shared_ptr<BpfAccelerator> bpf;
+
+  std::unique_ptr<PTState> pt_state;
+
   TicksSemantics ticks_semantics_;
-  bool started;
+  Enabled enabled;
+  bool opened;
   bool counting;
 };
 

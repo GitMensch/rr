@@ -1,0 +1,36 @@
+name: Build and test on runner
+
+on:
+  workflow_call:
+    inputs:
+      label:
+        required: true
+        type: string
+      architecture:
+        required: true
+        type: string
+
+jobs:
+  build-and-test:
+    name: On runner
+    runs-on:
+      - ${{ inputs.label }}
+      - arch_${{ inputs.architecture }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build
+        run: ./scripts/github-actions-build.sh
+
+      - name: Test
+        id: test
+        run: ./scripts/github-actions-test.sh
+
+      - name: Upload failed-test artifacts
+        uses: actions/upload-artifact@v4
+        if: failure() && steps.test.outcome == 'failure'
+        with:
+          name: failed-tests-${{ inputs.architecture }}
+          path: failed-tests/*
+          compression-level: 0

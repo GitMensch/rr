@@ -1,5 +1,6 @@
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
@@ -10,6 +11,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <ctime>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -25,11 +27,16 @@ static void print_usage(FILE* out) {
         "stack trace and dumps various other information to <out-file>\n"
         "then exits with error code 124. Otherwise exits with the child's\n"
         "exit code. Runs the child with\n"
-        "RUNNING_UNDER_TEST_MONITOR=<pid-of-test-monitor>.\n",
+        "RUNNING_UNDER_TEST_MONITOR=<pid-of-test-monitor>.\n"
+        "\n"
+        "If the environment variable RR_TEST_DIAGNOSE_TIMEOUT is set to a number\n"
+        "the value will be used as the timeout for each diagnostic commands\n"
+        "(e.g. gdb) after a test failure.\n",
         out);
 }
 
 static unsigned long timeout;
+static unsigned long diagnose_timeout = ULONG_MAX;
 
 static siginfo_t received_siginfo;
 
@@ -123,16 +130,54 @@ static void dump_proc_for_process(pid_t child, const char* suffix, FILE* out) {
 
 static void dump_popen_cmdline(const char* cmdline, FILE* out) {
   fprintf(out, "====== %s\n", cmdline);
-  FILE* st = popen(cmdline, "r");
-  if (!st) {
-    fprintf(out, "(execution failed)\n");
-    return;
+  int fds[2];
+  if (pipe(fds) != 0) {
+      fprintf(out, "(pipe creation failed)\n");
+      return;
   }
+  pid_t pid = fork();
+  if (pid == -1) {
+      fprintf(out, "(process creation failed)\n");
+      return;
+  }
+  if (pid == 0) {
+      close(fds[0]);
+      dup2(fds[1], 1);
+      close(fds[1]);
+      int ret = execl("/bin/sh", "/bin/sh", "-c", cmdline, NULL);
+      const char *msg = "(execution failed)\n";
+      __attribute__((unused)) ssize_t ret2 = write(fds[1], msg, strlen(msg));
+      exit(ret);
+  }
+  close(fds[1]);
+  fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL) | O_NONBLOCK);
   char line[1024 * 10];
-  while (fgets(line, sizeof(line), st)) {
-    fputs(line, out);
+  time_t start_time = time(NULL);
+
+  while (true) {
+      int status;
+      int ret = waitpid(pid, &status, WNOHANG);
+      ssize_t sz;
+      bool has_output = false;
+      while ((sz = read(fds[0], line, sizeof(line))) > 0) {
+          has_output = true;
+          fwrite(line, 1, sz, out);
+      }
+      // Error or exited
+      if (ret != 0)
+          break;
+      time_t new_time = time(NULL);
+      if (new_time > start_time &&
+          (unsigned long)(new_time - start_time) > diagnose_timeout) {
+          fprintf(out, "Command timeout: %s\n", cmdline);
+          kill(pid, SIGKILL);
+          break;
+      }
+      if (has_output)
+          continue;
+      sleep(1);
   }
-  pclose(st);
+  close(fds[0]);
 }
 
 static void dump_gdb_stacktrace(pid_t child, FILE* out) {
@@ -171,10 +216,11 @@ static void dump_emergency_debugger(char* gdb_cmd, FILE* out) {
     fprintf(out, "Can't find file name in cmd %s\n", gdb_cmd);
     return;
   }
-  sprintf(cmdline, "%s -ex 'set confirm off' -ex 'set height 0' "
-                   "-ex 'info registers' -ex "
-                   "'thread apply all bt' -ex q %s </dev/null 2>&1",
-          gdb_cmd, file_name);
+  snprintf(cmdline, sizeof(cmdline),
+           "%s -ex 'set confirm off' -ex 'set height 0' "
+           "-ex 'info registers' -ex "
+           "'thread apply all bt' -ex q %s </dev/null 2>&1",
+           gdb_cmd, file_name);
   dump_popen_cmdline(cmdline, out);
 }
 
@@ -308,6 +354,12 @@ int main(int argc, char* argv[]) {
   if (*endp || timeout > UINT32_MAX) {
     fprintf(stderr, "Invalid timeout %s\n", argv[1]);
     return 1;
+  }
+  if (char *diagnose_timeout_str = getenv("RR_TEST_DIAGNOSE_TIMEOUT")) {
+      diagnose_timeout = strtoul(diagnose_timeout_str, &endp, 10);
+      if (*endp) {
+          diagnose_timeout = ULONG_MAX;
+      }
   }
 
   pid_t child;

@@ -76,6 +76,7 @@ static bool parse_ls_arg(vector<string>& args, LsFlags& flags) {
 struct TraceInfo {
   string name;
   struct timespec ctime;
+  string exit;
 
   TraceInfo(string in_name) : name(in_name) {}
 };
@@ -130,16 +131,6 @@ static bool get_folder_size(string dir_name, string& size_str) {
   return true;
 }
 
-static bool is_valid_trace(const string& entry) {
-  if (entry[0] == '.' || entry[0] == '#') {
-    return false;
-  }
-  if (entry[entry.length() - 1] == '~') {
-    return false;
-  }
-  return true;
-}
-
 static string get_exec_path(TraceReader& reader) {
   while (true) {
     TraceTaskEvent r = reader.read_task_event();
@@ -153,17 +144,26 @@ static string get_exec_path(TraceReader& reader) {
   return string();
 }
 
+string find_exit_code(pid_t pid, const vector<TraceTaskEvent>& events,
+                      size_t current_event,
+                      const map<pid_t, pid_t> current_tid_to_pid);
+
 static int ls(const string& traces_dir, const LsFlags& flags, FILE* out) {
   DIR* dir = opendir(traces_dir.c_str());
   if (!dir) {
-    fprintf(stderr, "Cannot open %s", traces_dir.c_str());
+    fprintf(stderr, "Cannot open %s\n", traces_dir.c_str());
     return 1;
   }
 
+  const string cpu_lock = real_path(get_cpu_lock_file());
+  const string full_traces_dir = real_path(traces_dir) + "/";
   vector<TraceInfo> traces;
 
   while (struct dirent* trace_dir = readdir(dir)) {
-    if (!is_valid_trace(trace_dir->d_name)) {
+    if (full_traces_dir + trace_dir->d_name == cpu_lock) {
+      continue;
+    }
+    if (!is_valid_trace_name(trace_dir->d_name)) {
       continue;
     }
     traces.emplace_back(TraceInfo(string(trace_dir->d_name)));
@@ -171,6 +171,29 @@ static int ls(const string& traces_dir, const LsFlags& flags, FILE* out) {
       struct stat st;
       stat((traces_dir + "/" + trace_dir->d_name + "/data").c_str(), &st);
       traces.back().ctime = st.st_ctim;
+    }
+
+    if (flags.full_listing) {
+      TraceReader trace(traces_dir + "/" + trace_dir->d_name);
+
+      vector<TraceTaskEvent> events;
+      while (true) {
+        TraceTaskEvent r = trace.read_task_event();
+        if (r.type() == TraceTaskEvent::NONE) {
+          break;
+        }
+        events.push_back(r);
+      }
+
+      if (events.empty() || events[0].type() != TraceTaskEvent::EXEC) {
+        traces.back().exit = "????";
+        continue;
+      }
+
+      map<pid_t, pid_t> tid_to_pid;
+      pid_t initial_tid = events[0].tid();
+      tid_to_pid[initial_tid] = initial_tid;
+      traces.back().exit = find_exit_code(initial_tid, events, 0, tid_to_pid);
     }
   }
   closedir(dir);
@@ -204,8 +227,8 @@ static int ls(const string& traces_dir, const LsFlags& flags, FILE* out) {
         return max(m, static_cast<int>(t.name.length()));
     });
 
-  fprintf(out, "%-*s %-19s %5s %s\n", max_name_size,
-          "NAME", "WHEN", "SIZE", "CMD");
+  fprintf(out, "%-*s %-19s %5s %6s %s\n", max_name_size,
+          "NAME", "WHEN", "SIZE", "EXIT", "CMD");
 
   for (TraceInfo& t : traces) {
     // Record date & runtime estimates
@@ -228,8 +251,8 @@ static int ls(const string& traces_dir, const LsFlags& flags, FILE* out) {
       exe = get_exec_path(reader);
     }
 
-    fprintf(out, "%-*s %s %5s %s\n", max_name_size, t.name.c_str(),
-            outstr, folder_size.c_str(), exe.c_str());
+    fprintf(out, "%-*s %s %5s %6s %s\n", max_name_size, t.name.c_str(),
+            outstr, folder_size.c_str(), t.exit.c_str(), exe.c_str());
   }
 
   return 0;

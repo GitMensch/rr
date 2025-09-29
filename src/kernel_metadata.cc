@@ -5,12 +5,15 @@
 #include <errno.h>
 #include <linux/shm.h>
 #include <signal.h>
-#include <sys/ptrace.h>
 #include <syscall.h>
+#include <sys/resource.h>
+
+#include <sstream>
 
 #include "kernel_abi.h"
 #include "kernel_supplement.h"
 #include "log.h"
+#include "util.h"
 
 using namespace std;
 
@@ -68,7 +71,7 @@ string ptrace_event_name(int event) {
 
 #define PTRACE_ARCH_CASE(_id)                                                  \
   case Arch::_id:                                                              \
-    return #_id;
+    return #_id
 
 template <typename Arch>
 string ptrace_req_name(int request) {
@@ -89,18 +92,21 @@ string ptrace_req_name(int request) {
     PTRACE_ARCH_CASE(PTRACE_SETFPREGS);
     PTRACE_ARCH_CASE(PTRACE_GETFPXREGS);
     PTRACE_ARCH_CASE(PTRACE_SETFPXREGS);
-    CASE(PTRACE_ATTACH);
-    CASE(PTRACE_DETACH);
-    CASE(PTRACE_SYSCALL);
-    CASE(PTRACE_SETOPTIONS);
-    CASE(PTRACE_GETEVENTMSG);
-    CASE(PTRACE_GETSIGINFO);
-    CASE(PTRACE_SETSIGINFO);
-    CASE(PTRACE_GETREGSET);
-    CASE(PTRACE_SETREGSET);
-    CASE(PTRACE_SEIZE);
-    CASE(PTRACE_INTERRUPT);
-    CASE(PTRACE_LISTEN);
+    PTRACE_ARCH_CASE(PTRACE_ATTACH);
+    PTRACE_ARCH_CASE(PTRACE_DETACH);
+    PTRACE_ARCH_CASE(PTRACE_SYSCALL);
+    PTRACE_ARCH_CASE(PTRACE_SETOPTIONS);
+    PTRACE_ARCH_CASE(PTRACE_GETEVENTMSG);
+    PTRACE_ARCH_CASE(PTRACE_GETSIGINFO);
+    PTRACE_ARCH_CASE(PTRACE_SETSIGINFO);
+    PTRACE_ARCH_CASE(PTRACE_GETREGSET);
+    PTRACE_ARCH_CASE(PTRACE_SETREGSET);
+    PTRACE_ARCH_CASE(PTRACE_SEIZE);
+    PTRACE_ARCH_CASE(PTRACE_INTERRUPT);
+    PTRACE_ARCH_CASE(PTRACE_LISTEN);
+    PTRACE_ARCH_CASE(PTRACE_GETSIGMASK);
+    PTRACE_ARCH_CASE(PTRACE_SETSIGMASK);
+    PTRACE_ARCH_CASE(PTRACE_GET_SYSCALL_INFO);
     // These aren't part of the official ptrace-request enum.
     PTRACE_ARCH_CASE(PTRACE_SYSEMU);
     PTRACE_ARCH_CASE(PTRACE_SYSEMU_SINGLESTEP);
@@ -411,23 +417,6 @@ string sicode_name(int code, int sig) {
   return string(buf);
 }
 
-ostream& operator<<(ostream& stream, const siginfo_t& siginfo) {
-  stream << "{signo:" << signal_name(siginfo.si_signo)
-         << ",errno:" << errno_name(siginfo.si_errno)
-         << ",code:" << sicode_name(siginfo.si_code, siginfo.si_signo);
-  switch (siginfo.si_signo) {
-    case SIGILL:
-    case SIGFPE:
-    case SIGSEGV:
-    case SIGBUS:
-    case SIGTRAP:
-      stream << ",addr:" << siginfo.si_addr;
-      break;
-  }
-  stream << "}";
-  return stream;
-}
-
 int shm_flags_to_mmap_prot(int flags) {
   return PROT_READ | ((flags & SHM_RDONLY) ? 0 : PROT_WRITE) |
          ((flags & SHM_EXEC) ? PROT_EXEC : 0);
@@ -490,6 +479,161 @@ bool is_coredumping_signal(int signo) {
     default:
         return false;
   }
+}
+
+#define SI_COPY(f) result._sifields.f = si._sifields.f
+
+template <typename Arch>
+NativeArch::siginfo_t convert_to_native_siginfo_arch(const void* data,
+    size_t size) {
+  typename Arch::siginfo_t si;
+  if (size != sizeof(si)) {
+    FATAL() << "Siginfo has wrong size";
+  }
+
+  NativeArch::siginfo_t result;
+  if (Arch::arch() == NativeArch::arch()) {
+    // Do the simple correct thing to make sure there are no bugs in this all-important case.
+    memcpy(&result, data, sizeof(result));
+    return result;
+  }
+
+  // We need to translate formats :-(.
+  memcpy(&si, data, sizeof(si));
+
+  result.si_signo = si.si_signo;
+  result.si_errno = si.si_errno;
+  result.si_code = si.si_code;
+  memset(result._sifields.padding, 0, sizeof(result._sifields.padding));
+  if (result.si_code <= 0) {
+    switch (result.si_code) {
+      case SI_USER:
+        SI_COPY(_kill.si_pid_);
+        SI_COPY(_kill.si_uid_);
+        break;
+      case SI_QUEUE:
+      case SI_MESGQ:
+        SI_COPY(_rt.si_pid_);
+        SI_COPY(_rt.si_uid_);
+        SI_COPY(_rt.si_sigval_.sival_ptr.val);
+        break;
+      case SI_TIMER:
+        SI_COPY(_timer.si_tid_);
+        SI_COPY(_timer.si_overrun_);
+        SI_COPY(_timer.si_sigval_.sival_ptr.val);
+        break;
+      default:
+        break;
+    }
+  } else {
+    switch (result.si_signo) {
+      case SIGCHLD:
+        SI_COPY(_sigchld.si_pid_);
+        SI_COPY(_sigchld.si_uid_);
+        SI_COPY(_sigchld.si_status_);
+        SI_COPY(_sigchld.si_stime_);
+        SI_COPY(_sigchld.si_utime_);
+        break;
+      case SIGILL:
+      case SIGFPE:
+      case SIGSEGV:
+      case SIGBUS:
+      case SIGTRAP:
+        SI_COPY(_sigfault.si_addr_.val);
+        SI_COPY(_sigfault.si_addr_lsb_);
+        SI_COPY(_sigfault._bounds._addr_bnds._lower.val);
+        SI_COPY(_sigfault._bounds._addr_bnds._upper.val);
+        break;
+      case SIGPOLL:
+        SI_COPY(_sigpoll.si_band_);
+        SI_COPY(_sigpoll.si_fd_);
+        break;
+      case SIGSYS:
+        SI_COPY(_sigsys._call_addr.val);
+        SI_COPY(_sigsys._syscall);
+        SI_COPY(_sigsys._arch);
+        break;
+    }
+  }
+
+  return result;
+}
+
+NativeArch::siginfo_t convert_to_native_siginfo(SupportedArch arch,
+    const void* data, size_t size) {
+  RR_ARCH_FUNCTION(convert_to_native_siginfo_arch, arch, data, size);
+}
+
+string rlimit_resource_name(int resource) {
+  switch (resource) {
+    CASE(RLIMIT_AS);
+    CASE(RLIMIT_CORE);
+    CASE(RLIMIT_CPU);
+    CASE(RLIMIT_DATA);
+    CASE(RLIMIT_FSIZE);
+    CASE(RLIMIT_LOCKS);
+    CASE(RLIMIT_MEMLOCK);
+    CASE(RLIMIT_MSGQUEUE);
+    CASE(RLIMIT_NICE);
+    CASE(RLIMIT_NOFILE);
+    CASE(RLIMIT_NPROC);
+    CASE(RLIMIT_RSS);
+    CASE(RLIMIT_RTPRIO);
+    CASE(RLIMIT_RTTIME);
+    CASE(RLIMIT_SIGPENDING);
+    CASE(RLIMIT_STACK);
+  default:
+    char buf[100];
+    snprintf(buf, sizeof(buf), "Unknown RLIMIT_ %d", resource);
+    return string(buf);
+  }
+}
+
+string prot_flags_string(int prot) {
+  char prot_flags[] = "rwx";
+  if (!(prot & PROT_READ)) {
+    prot_flags[0] = '-';
+  }
+  if (!(prot & PROT_WRITE)) {
+    prot_flags[1] = '-';
+  }
+  if (!(prot & PROT_EXEC)) {
+    prot_flags[2] = '-';
+  }
+  stringstream ret;
+  ret << prot_flags;
+  if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) {
+    ret << " (" << HEX(prot) << ")";
+  }
+  return ret.str();
+}
+
+int addr_bits(SupportedArch arch) {
+  switch (arch) {
+    default:
+      DEBUG_ASSERT(0 && "Unknown architecture");
+      RR_FALLTHROUGH;
+    case x86:
+      return 32;
+    // Current x86-64 systems have only 48 bits of virtual address space,
+    // and only the bottom half is usable by user space
+    case x86_64:
+      return 47;
+    // Aarch64 has 48 bit address space, with user and kernel each getting
+    // their own 48 bits worth of address space at opposite end of the full
+    // 64-bit address space.
+    case aarch64:
+      return 48;
+  }
+}
+
+remote_ptr<void> usable_address_space_end(SupportedArch arch) {
+  auto addr_end = remote_ptr<void>((uint64_t(1) << addr_bits(arch)) - page_size());
+#if defined(__i386)
+  // Further limit address space in 32-bit rr to avoid interfering with kernel space.
+  addr_end = min(addr_end, remote_ptr<void>(0xc0000000 - page_size()));
+#endif
+  return addr_end;
 }
 
 } // namespace rr

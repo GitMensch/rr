@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "AddressSpace.h"
+#include "CPUs.h"
 #include "MonitoredSharedMemory.h"
 #include "Task.h"
 #include "TaskishUid.h"
@@ -134,7 +135,7 @@ struct BreakStatus {
     return result;
   }
 
-  bool any_break() {
+  bool any_break() const {
     return !watchpoints_hit.empty() || signal || breakpoint_hit ||
            singlestep_complete || approaching_ticks_target;
   }
@@ -266,7 +267,7 @@ public:
    * to notify this session that the objects are dying.
    */
   void on_destroy(AddressSpace* vm);
-  virtual void on_destroy(Task* t);
+  void on_destroy(Task* t);
   void on_create(ThreadGroup* tg);
   void on_destroy(ThreadGroup* tg);
 
@@ -289,8 +290,11 @@ public:
   bool is_replaying() { return as_replay() != nullptr; }
   bool is_diversion() { return as_diversion() != nullptr; }
 
-  bool visible_execution() const { return visible_execution_; }
+  // Indicate if execution should be "visible", i.e. it's the main
+  // session of a recording or a replay whose output could be echoed.
   void set_visible_execution(bool visible) { visible_execution_ = visible; }
+
+  virtual bool need_performance_counters() const { return true; }
 
   struct Statistics {
     Statistics()
@@ -309,39 +313,45 @@ public:
   Statistics statistics() { return statistics_; }
 
   virtual Task* new_task(pid_t tid, pid_t rec_tid, uint32_t serial,
-                         SupportedArch a);
+                         SupportedArch a, const std::string& name);
 
   std::string read_spawned_task_error() const;
 
+  /* Returns an empty mapping if the tracee died.
+   * If map_address is non-null then we must use that address in the tracee,
+   * otherwise we select the address.
+   */
   static KernelMapping create_shared_mmap(
-      AutoRemoteSyscalls& remote, size_t size, remote_ptr<void> map_hint,
+      AutoRemoteSyscalls& remote, size_t size, remote_ptr<void> required_child_addr,
       const char* name, int tracee_prot = PROT_READ | PROT_WRITE,
       int tracee_flags = 0,
-      MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
+      MonitoredSharedMemory::shr_ptr monitored = nullptr);
 
-  static bool make_private_shared(AutoRemoteSyscalls& remote,
+  static void make_private_shared(AutoRemoteSyscalls& remote,
                                   const AddressSpace::Mapping m);
   enum PreserveContents {
     PRESERVE_CONTENTS,
     DISCARD_CONTENTS,
   };
   // Recreate an mmap region that is shared between rr and the tracee. The
-  // caller
-  // is responsible for recreating the data in the new mmap, if `preserve` is
+  // caller is responsible for recreating the data in the new mmap, if `preserve` is
   // DISCARD_CONTENTS.
   // OK to call this while 'm' references one of the mappings in remote's
-  // AddressSpace
-  static const AddressSpace::Mapping& recreate_shared_mmap(
+  // AddressSpace.
+  // Returns an empty Mapping if the tracee died unexpectedly.
+  static const AddressSpace::Mapping recreate_shared_mmap(
       AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
       PreserveContents preserve = DISCARD_CONTENTS,
-      MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
+      MonitoredSharedMemory::shr_ptr monitored = nullptr);
 
   /* Takes a mapping and replaces it by one that is shared between rr and
      the tracee. The caller is responsible for filling the contents of the
-      new mapping. */
-  static const AddressSpace::Mapping& steal_mapping(
+      new mapping.
+      Returns an empty mapping if the tracee unexpectedly died.
+   */
+  static AddressSpace::Mapping steal_mapping(
       AutoRemoteSyscalls& remote, const AddressSpace::Mapping& m,
-      MonitoredSharedMemory::shr_ptr&& monitored = nullptr);
+      MonitoredSharedMemory::shr_ptr monitored = nullptr);
 
   enum PtraceSyscallBeforeSeccomp {
     PTRACE_SYSCALL_BEFORE_SECCOMP,
@@ -356,13 +366,15 @@ public:
   static const char* rr_mapping_prefix();
 
   ScopedFd& tracee_socket_fd() { return *tracee_socket; }
+  // Before using this, it must be drained. See AutoRemoteSyscalls.
   ScopedFd& tracee_socket_receiver_fd() { return *tracee_socket_receiver; }
   int tracee_fd_number() const { return tracee_socket_fd_number; }
 
   virtual TraceStream* trace_stream() { return nullptr; }
   TicksSemantics ticks_semantics() const { return ticks_semantics_; }
 
-  virtual int cpu_binding(TraceStream& trace) const;
+  // Must be `UNBOUND` or `SPECIFIED_CORE`.
+  virtual BindCPU cpu_binding() const;
 
   int syscall_number_for_rrcall_init_preload() const {
     return SYS_rrcall_init_preload - RR_CALL_BASE + rrcall_base_;
@@ -388,16 +400,32 @@ public:
   int syscall_number_for_rrcall_notify_stap_semaphore_removed() const {
     return SYS_rrcall_notify_stap_semaphore_removed - RR_CALL_BASE + rrcall_base_;
   }
+  int syscall_number_for_rrcall_rdtsc() const {
+    return SYS_rrcall_rdtsc - RR_CALL_BASE + rrcall_base_;
+  }
+  uint32_t syscallbuf_fds_disabled_size() const {
+    return syscallbuf_fds_disabled_size_;
+  }
+  uint32_t syscallbuf_hdr_size() const {
+    return syscallbuf_hdr_size_;
+  }
 
   /* Bind the current process to the a CPU as specified in the session options
      or trace */
-  void do_bind_cpu(TraceStream &trace);
+  void do_bind_cpu();
 
   const ThreadGroupMap& thread_group_map() const { return thread_group_map_; }
 
   virtual int tracee_output_fd(int dflt) {
     return dflt;
   }
+
+  void set_intel_pt_enabled(bool intel_pt) { intel_pt_ = intel_pt; }
+  /* When this is true, we collect Intel PT traces during recording
+     or replay. */
+  bool intel_pt_enabled() const { return intel_pt_; }
+
+  virtual bool mark_stdio() const;
 
 protected:
   Session();
@@ -441,6 +469,8 @@ protected:
   ScopedFd spawned_task_error_fd_;
 
   int rrcall_base_;
+  uint32_t syscallbuf_fds_disabled_size_;
+  uint32_t syscallbuf_hdr_size_;
   PtraceSyscallBeforeSeccomp syscall_seccomp_ordering_;
 
   TicksSemantics ticks_semantics_;
@@ -455,6 +485,11 @@ protected:
    * True while the execution of this session is visible to users.
    */
   bool visible_execution_;
+
+  /**
+   * True while we're collecting Intel PT data.
+   */
+  bool intel_pt_;
 };
 
 } // namespace rr

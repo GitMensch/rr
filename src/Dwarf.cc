@@ -198,7 +198,7 @@ DwarfAbbrev* DwarfAbbrevSet::lookup(uint64_t code) {
       LOG(warn) << "Invalid DWARF abbrev table!";
       return nullptr;
     }
-    abbrevs.insert(make_pair(abbrev_code, move(abbrev)));
+    abbrevs.insert(make_pair(abbrev_code, std::move(abbrev)));
     if (code == abbrev_code) {
       return abbrev_raw;
     }
@@ -215,7 +215,7 @@ DwarfAbbrevSet& DwarfAbbrevs::lookup(uint64_t offset) {
 
   unique_ptr<DwarfAbbrevSet> set(new DwarfAbbrevSet(debug_abbrev.subspan(offset)));
   auto set_raw = set.get();
-  abbrevs.insert(make_pair(offset, move(set)));
+  abbrevs.insert(make_pair(offset, std::move(set)));
   return *set_raw;
 }
 
@@ -224,7 +224,7 @@ static DwarfAbbrev null_abbrev;
 DwarfDIE::DwarfDIE(DwarfSpan span, DwarfAbbrevSet& abbrevs, uint8_t dwarf_size, uint8_t address_size, bool* ok)
   : address_size(address_size), dwarf_size(dwarf_size) {
   uint64_t code = span.read_uleb(ok);
-  if (!ok) {
+  if (!*ok) {
     return;
   }
   if (code == 0) {
@@ -243,7 +243,7 @@ DwarfDIE::DwarfDIE(DwarfSpan span, DwarfAbbrevSet& abbrevs, uint8_t dwarf_size, 
 static size_t form_size(DWForm form, size_t address_size, size_t dwarf_size, DwarfSpan* span, bool* ok) {
   if (form == DW_FORM_indirect) {
     form = (DWForm)span->read_uleb(ok);
-    if (!ok) {
+    if (!*ok) {
       return 0;
     }
   }
@@ -251,7 +251,7 @@ static size_t form_size(DWForm form, size_t address_size, size_t dwarf_size, Dwa
     auto before = span->size();
     DwarfSpan a_span(*span);
     a_span.read_uleb(ok);
-    if (!ok) {
+    if (!*ok) {
       return 0;
     }
     return before - a_span.size();
@@ -276,7 +276,7 @@ static size_t form_size(DWForm form, size_t address_size, size_t dwarf_size, Dwa
       auto before = span->size();
       DwarfSpan a_span(*span);
       a_span.read_null_terminated_string(ok);
-      if (!ok) {
+      if (!*ok) {
         return 0;
       }
       return before - a_span.size();
@@ -284,6 +284,7 @@ static size_t form_size(DWForm form, size_t address_size, size_t dwarf_size, Dwa
     case DW_FORM_sec_offset: return dwarf_size;
     case DW_FORM_flag_present: return 0;
     case DW_FORM_implicit_const: return 0;
+    case DW_FORM_rnglistx: return dwarf_size;
     case DW_FORM_strp_sup: return dwarf_size;
     case DW_FORM_GNU_strp_alt: return dwarf_size;
     default:
@@ -415,7 +416,7 @@ static const char* decode_string(const DwarfCompilationUnit& cu, DwarfSpan span,
 int64_t DwarfDIE::section_ptr_attr(DWAttr attr, bool* ok) const {
   DWForm form;
   auto span = find_attribute(attr, &form, ok);
-  if (span.empty() || !ok) {
+  if (span.empty() || !*ok) {
     return -1;
   }
   return decode_section_ptr(span, form, ok);
@@ -424,7 +425,7 @@ int64_t DwarfDIE::section_ptr_attr(DWAttr attr, bool* ok) const {
 uint64_t DwarfDIE::unsigned_attr(DWAttr attr, bool* found, bool* ok) const {
   DWForm form;
   auto span = find_attribute(attr, &form, ok);
-  if (span.empty() || !ok) {
+  if (span.empty() || !*ok) {
     *found = false;
     return 0;
   }
@@ -435,7 +436,7 @@ uint64_t DwarfDIE::unsigned_attr(DWAttr attr, bool* found, bool* ok) const {
 const char* DwarfDIE::string_attr(const DwarfCompilationUnit& cu, DWAttr attr, const DebugStrSpans& debug_strs, bool* ok) const {
   DWForm form;
   auto span = find_attribute(attr, &form, ok);
-  if (span.empty() || !ok) {
+  if (span.empty() || !*ok) {
     return nullptr;
   }
   return decode_string(cu, span, form, debug_strs, ok);
@@ -444,7 +445,7 @@ const char* DwarfDIE::string_attr(const DwarfCompilationUnit& cu, DWAttr attr, c
 DwarfCompilationUnit DwarfCompilationUnit::next(DwarfSpan* debug_info, DwarfAbbrevs& abbrevs, bool* ok) {
   DwarfCompilationUnit ret;
   uint32_t word = DwarfSpan(*debug_info).read_value<uint32_t>(ok);
-  if (!ok) {
+  if (!*ok) {
     return ret;
   }
   if (word == 0xFFFFFFFF) {
@@ -457,14 +458,14 @@ DwarfCompilationUnit DwarfCompilationUnit::next(DwarfSpan* debug_info, DwarfAbbr
 
 template <typename D> void DwarfCompilationUnit::init_size(DwarfSpan* debug_info, DwarfAbbrevs& abbrevs, bool* ok) {
   auto h = DwarfSpan(*debug_info).read<Dwarf4CompilationUnitHeader<D>>(ok);
-  if (!ok) {
+  if (!*ok) {
     return;
   }
   if (2 <= h->version && h->version <= 4) {
     init<Dwarf4CompilationUnitHeader<D>>(debug_info, abbrevs, ok);
   } else if (h->version == 5) {
     auto hh = DwarfSpan(*debug_info).read<Dwarf5CompilationUnitHeader<D>>(ok);
-    if (!ok) {
+    if (!*ok) {
       return;
     }
     if (hh->unit_type == DW_UT_skeleton || hh->unit_type == DW_UT_split_compile) {
@@ -521,7 +522,7 @@ uint64_t DwarfCompilationUnit::read_entry_sized_value(DwarfSpan span, bool* ok) 
 
 DwarfLineNumberTable::DwarfLineNumberTable(const DwarfCompilationUnit& cu, DwarfSpan span, const DebugStrSpans& debug_str, bool* ok) {
   uint32_t word = DwarfSpan(span).read_value<uint32_t>(ok);
-  if (!ok) {
+  if (!*ok) {
     return;
   }
   if (word == 0xFFFFFFFF) {
@@ -533,7 +534,7 @@ DwarfLineNumberTable::DwarfLineNumberTable(const DwarfCompilationUnit& cu, Dwarf
 
 template <typename D> void DwarfLineNumberTable::init_size(const DwarfCompilationUnit& cu, DwarfSpan span, const DebugStrSpans& debug_str, bool* ok) {
   auto h = DwarfSpan(span).read<Dwarf2LineNumberTableHeader<D>>(ok);
-  if (!ok) {
+  if (!*ok) {
     return;
   }
   if (2 <= h->version && h->version <= 3) {
@@ -759,13 +760,13 @@ template <typename H> void DwarfLineNumberTable::init(const DwarfCompilationUnit
                                                       const DebugStrSpans& debug_str,
                                                       bool* ok) {
   auto h = span.read<H>(ok);
-  if (!ok) {
+  if (!*ok) {
     return;
   }
   for (uint8_t i = 1; i < h->opcode_base; ++i) {
     span.read_uleb(ok);
   }
-  if (!ok) {
+  if (!*ok) {
     return;
   }
   *ok = h->read_directories(cu, span, debug_str, directories_, file_names_);

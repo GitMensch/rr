@@ -24,6 +24,9 @@ Event::Event(const Event& o) : event_type(o.event_type) {
     case EV_PATCH_SYSCALL:
       new (&PatchSyscall()) PatchSyscallEvent(o.PatchSyscall());
       return;
+    case EV_SCHED:
+      new (&Sched()) SchedEvent(o.Sched());
+      return;
     case EV_SIGNAL:
     case EV_SIGNAL_DELIVERY:
     case EV_SIGNAL_HANDLER:
@@ -95,10 +98,18 @@ bool Event::record_extra_regs() const {
     case EV_SYSCALL: {
       const SyscallEvent& sys_ev = Syscall();
       // sigreturn/rt_sigreturn restores register state
+      // execve sets everything under the sun, and
+      // pkey_alloc modifies the PKRU register.
       return sys_ev.state == EXITING_SYSCALL &&
              (is_sigreturn(sys_ev.number, sys_ev.arch()) ||
-              is_execve_syscall(sys_ev.number, sys_ev.arch()));
+              sys_ev.is_exec() ||
+              is_pkey_alloc_syscall(sys_ev.number, sys_ev.arch()));
     }
+    case EV_SIGNAL:
+      // Record extra regs so we can deliver the signal at the
+      // right time even when GP regs and ticks values are unchanged
+      // but extra regs have changed.
+      return true;
     case EV_SIGNAL_HANDLER:
       // entering a signal handler seems to clear FP/SSE regs,
       // so record these effects.

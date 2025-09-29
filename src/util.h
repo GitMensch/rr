@@ -3,16 +3,27 @@
 #ifndef RR_UTIL_H_
 #define RR_UTIL_H_
 
+/* This header should not declare any interface types. It should mainly be included
+   in .cc files.
+ */
+
 #include <signal.h>
 #include <stdio.h>
 #include <math.h>
 
 #include <array>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
 
+#if defined(__i386__) || defined(__x86_64__)
+#include <x86intrin.h>
+#endif
+
+#include "CPUs.h"
+#include "MemoryRange.h"
 #include "ScopedFd.h"
 #include "TraceFrame.h"
 #include "remote_ptr.h"
@@ -23,10 +34,6 @@
  * Note that SIGUNUSED means SIGSYS which actually *is* used (by seccomp),
  * so we can't use it. */
 #define SYSCALLBUF_DEFAULT_DESCHED_SIGNAL SIGPWR
-
-#ifndef SOL_NETLINK
-#define SOL_NETLINK 270
-#endif
 
 #define UNUSED(expr)     \
   do {                   \
@@ -50,6 +57,7 @@ class KernelMapping;
 class Task;
 class TraceFrame;
 class RecordTask;
+class ReplayTask;
 
 enum Completion { COMPLETE, INCOMPLETE };
 
@@ -89,14 +97,13 @@ void dump_binary_data(const char* filename, const char* label,
 /**
  * Format a suitable filename within the trace directory for dumping
  * information about |t| at the current global time, to a file that
- * contains |tag|.  The constructed filename is returned through
- * |filename|.  For example, a filengit logame for a task with tid 12345 at
+ * contains |tag|.  For example, a file for a task with tid 12345 at
  * time 111, for a file tagged "foo", would be something like
- * "trace_0/12345_111_foo".  The returned name is not guaranteed to be
+ * "trace_0/111_12345_foo".  The returned name is not guaranteed to be
  * unique, caveat emptor.
  */
-void format_dump_filename(Task* t, FrameTime global_time, const char* tag,
-                          char* filename, size_t filename_size);
+std::string format_dump_filename(Task* t, FrameTime global_time,
+                                 const char* tag);
 
 /**
  * Return true if the user requested memory be dumped at this event/time.
@@ -118,12 +125,23 @@ bool should_checksum(const Event& event, FrameTime time);
  * special log, where it can be read by |validate_process_memory()|
  * during replay.
  */
-void checksum_process_memory(Task* t, FrameTime global_time);
+void checksum_process_memory(RecordTask* t, FrameTime global_time);
 /**
  * Validate the checksum of |t|'s address space that was written
  * during recording.
  */
-void validate_process_memory(Task* t, FrameTime global_time);
+void validate_process_memory(ReplayTask* t, FrameTime global_time);
+
+/**
+ * Write raw PT data to a file in the trace dir.
+ */
+void write_pt_data(Task* t, FrameTime global_time,
+                   const std::vector<std::vector<uint8_t>>& data);
+
+/**
+ * Read raw PT data to a file in the trace dir. Returns an empty vector if none found.
+ */
+std::vector<uint8_t> read_pt_data(Task* t, FrameTime global_time);
 
 /**
  * Return nonzero if the rr session is probably not interactive (that
@@ -202,11 +220,13 @@ enum cpuid_requests {
   CPUID_AMD_PLATFORM_QOS = 0x80000020
 };
 
+constexpr int AVX_512_FOUNDATION_FLAG = 1 << 16;
 const int XSAVE_FEATURE_FLAG = 1 << 26;
 const int OSXSAVE_FEATURE_FLAG = 1 << 27;
 const int AVX_FEATURE_FLAG = 1 << 28;
 const int HLE_FEATURE_FLAG = 1 << 4;
 const int XSAVEC_FEATURE_FLAG = 1 << 1;
+const int PKU_FEATURE_FLAG = 1 << 3;
 
 /** issue a single request to CPUID. Fits 'intel features', for instance
  *  note that even if only "eax" and "edx" are of interest, other registers
@@ -394,18 +414,34 @@ inline bool is_kernel_trap(int si_code) {
 
 enum ProbePort { DONT_PROBE = 0, PROBE_PORT };
 
-ScopedFd open_socket(const char* address, unsigned short* port,
-                     ProbePort probe);
+struct OpenedSocket {
+  ScopedFd fd;
+  int domain;
+  std::string host;
+  unsigned short port;
+};
+
+// Open a socket bound to the given address and port.
+// If PROBE_PORT is set, probes for a usable port and sets it
+// in *port.
+// If `host` is empty, binds to localhost.
+// Returns the actual bound address, socket domain, and port.
+// Selects IPv4 or IPv6 automatically depending on what's in the
+// host address and what's available.
+OpenedSocket open_socket(const std::string& host, unsigned short port,
+                         ProbePort probe);
 
 /**
  * Like `abort`, but tries to wake up test-monitor for a snapshot if possible.
+ * We try not to allocate.
  */
 void notifying_abort();
 
 /**
- * Dump the current rr stack
+ * Dump the current rr stack to the given file.
+ * We try not to allocate.
  */
-void dump_rr_stack();
+void dump_rr_stack(ScopedFd& fd);
 
 /**
  * Check for leaked mappings etc
@@ -446,23 +482,31 @@ void good_random(void* out, size_t out_len);
 
 std::vector<std::string> current_env();
 
-int get_num_cpus();
+enum class SpecialInstOpcode {
+  NONE,
+  ARM_MRS_CNTFRQ_EL0,
+  ARM_MRS_CNTVCT_EL0,
+  ARM_MRS_CNTVCTSS_EL0,
+  X86_RDTSC,
+  X86_RDTSCP,
+  X86_CPUID,
+  X86_INT3,
+  X86_PUSHF,
+  X86_PUSHF16,
+};
 
-enum class TrappedInstruction {
-  NONE = 0,
-  RDTSC = 1,
-  RDTSCP = 2,
-  CPUID = 3,
-  INT3 = 4,
-  PUSHF = 5,
-  PUSHF16 = 6,
+struct SpecialInst {
+  SpecialInstOpcode opcode;
+  unsigned regno = 0;
 };
 
 /* If |t->ip()| points at a decoded instruction, return the instruction */
-TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip);
+SpecialInst special_instruction_at(Task* t, remote_code_ptr ip);
+
+extern const uint8_t rdtsc_insn[2];
 
 /* Return the length of the TrappedInstruction */
-size_t trapped_instruction_len(TrappedInstruction insn);
+size_t special_instruction_len(SpecialInstOpcode insn);
 
 /**
  * Certain instructions generate deterministic signals but also advance pc.
@@ -470,16 +514,14 @@ size_t trapped_instruction_len(TrappedInstruction insn);
  */
 bool is_advanced_pc_and_signaled_instruction(Task* t, remote_code_ptr ip);
 
-/**
- * BIND_CPU means binding to a randomly chosen CPU.
- * UNBOUND_CPU means not binding to a particular CPU.
- * A non-negative value means binding to the specific CPU number.
- */
-enum BindCPU { BIND_CPU = -2, UNBOUND_CPU = -1 };
+/* Get the path of the cpu lock file */
+std::string get_cpu_lock_file();
 
 /* Convert a BindCPU to a specific CPU number. If possible, the cpu_lock_fd_out
    will be set to an fd that holds an advisory fcntl lock for the chosen CPU
-   for coordination with other rr processes */
+   for coordination with other rr processes.
+   Returns -1 if there should be no binding.
+*/
 int choose_cpu(BindCPU bind_cpu, ScopedFd& cpu_lock_fd_out);
 
 /* Updates an IEEE 802.3 CRC-32 least significant bit first from each byte in
@@ -492,12 +534,44 @@ uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len);
 void write_all(int fd, const void* buf, size_t size);
 
 /* Like pwrite64(2) but we try to write all bytes by looping on short writes. */
-ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off64_t offset);
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset);
 
 /* Returns true if |path| is an accessible directory. Returns false if there
  * was an error.
  */
 bool is_directory(const char* path);
+
+/*
+ * Returns a pointer to the filename portion of the path.
+ * That is the position after the last '/'
+ */
+const char* filename(const char* path);
+
+/*
+ * Returns whether a trace is at the path by checking for a version or
+ * incomplete file.
+ * Will set errno, if false.
+ */
+bool is_trace(const std::string& path);
+
+/*
+ * Returns whether the latest_trace symlink (if any) points to |trace|.
+ */
+bool is_latest_trace(const std::string& trace);
+
+/*
+ * Deletes the latest_trace symlink, logs an error and returns false on failure.
+ */
+bool remove_latest_trace_symlink();
+
+/*
+ * Returns whether |entry| is a valid trace name.
+ * If invalid, optional out-param |reason| will be set to the reason.
+ * I.e. does not start with . or #, does not end with ~, is neither cpu_lock
+ * nor latest_trace.
+ */
+bool is_valid_trace_name(const std::string& entry,
+                         std::string* reason = nullptr);
 
 /**
  * Read bytes from `fd` into `buf` from `offset` until the read returns an
@@ -556,6 +630,67 @@ int pop_count(uint64_t v);
 /* A version of fatal that uses no allocation/thread resource and is thus
   safe to use in volatile contexts */
 void SAFE_FATAL(int err, const char *msg);
+
+bool coredumping_signal_takes_down_entire_vm();
+
+/* Parse tid from the proc file system path /proc/<pid>/<property> or /proc/<pid>/task/<tid>/<property> */
+int parse_tid_from_proc_path(const std::string& pathname, const std::string& property);
+
+inline unsigned long long rdtsc(void) {
+#if defined(__i386__) || defined(__x86_64__)
+  return __rdtsc();
+#else
+  FATAL() << "Reached x86-only code path on non-x86 architecture";
+  return 0;
+#endif
+}
+
+inline unsigned long long cntfrq(void) {
+#if defined(__aarch64__)
+  unsigned long long val;
+  asm volatile("mrs %0, CNTFRQ_EL0" : "=r" (val));
+  return val;
+#else
+  FATAL() << "Reached AArch64-only code path on non-AArch64 architecture";
+  return 0;
+#endif
+}
+
+inline unsigned long long cntvct(void) {
+#if defined(__aarch64__)
+  unsigned long long val;
+  asm volatile("mrs %0, CNTVCT_EL0" : "=r" (val));
+  return val;
+#else
+  FATAL() << "Reached AArch64-only code path on non-AArch64 architecture";
+  return 0;
+#endif
+}
+
+inline unsigned long long dczid_el0_block_size(void) {
+#if defined(__aarch64__)
+  unsigned long long val;
+  asm volatile("mrs %0, DCZID_EL0" : "=r" (val));
+  return 4ULL << (val & 0xF);
+#else
+  FATAL() << "Reached AArch64-only code path on non-AArch64 architecture";
+  return 0;
+#endif
+}
+
+/**
+ * If `src` overlaps `dst`, replace the bytes in `dst_data` from the range `dst`
+ * with the corresponding bytes in `src_data` from the range `src`.
+ */
+void replace_in_buffer(MemoryRange src, const uint8_t* src_data,
+                       MemoryRange dst, uint8_t* dst_data);
+
+// Strip any directory part from the filename `s`
+void base_name(std::string& s);
+
+std::optional<int> read_perf_event_paranoid();
+
+bool virtual_address_size_supported(uint8_t bit_size);
 
 } // namespace rr
 

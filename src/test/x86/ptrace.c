@@ -42,7 +42,7 @@ static size_t find_xsave_size(void) {
  * bytes 416-463 to cause trouble. Note that while these bytes do not have any
  * corresponding register values, the kernel does keep a copy in the fpu
  * structure. The kernel zeros these bytes on allocation, but ptrace moves them
- * in and out of the kernel fairly non-discriminantly, so if these bytes end up
+ * in and out of the kernel fairly non-discriminately, so if these bytes end up
  * non-zero we'll notice in this test, which brings us to how they actually end
  * up non-zero in this test (spoiler not via ptrace):
  *
@@ -267,6 +267,12 @@ int main(void) {
   test_assert(0 == ptrace(PTRACE_POKEUSER, child,
                           (void*)offsetof(struct user, u_debugreg[0]),
                           (void*)0));
+#ifdef __x86_64__
+  // On x86-64 the user struct also includes error_code and fault_address at the
+  // end. This is not in glibc's copy of user.
+  test_assert(0 == ptrace(PTRACE_PEEKUSER, child,
+                          (void*)offsetof(struct user, u_debugreg[9]), NULL));
+#endif
 
   /* Test invalid signal in continue */
   test_assert(-1 == ptrace(PTRACE_CONT, child, NULL, -1) && errno == EIO);

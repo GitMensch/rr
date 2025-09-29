@@ -14,6 +14,7 @@
 
 namespace rr {
 
+class ElfReader;
 class RecordTask;
 class ScopedFd;
 class Task;
@@ -62,7 +63,25 @@ public:
    * Zero or more mapping operations are also recorded to the trace and must
    * be replayed.
    */
-  bool try_patch_syscall(RecordTask* t, bool entering_syscall = true);
+  bool try_patch_syscall(RecordTask* t, bool entering_syscall, bool &should_retry);
+  bool try_patch_syscall(RecordTask* t, bool entering_syscall, bool &should_retry, remote_code_ptr ip);
+
+  bool try_patch_syscall_x86ish(RecordTask* t, remote_code_ptr ip, bool entering_syscall,
+                                SupportedArch arch, bool &should_retry);
+  bool try_patch_syscall_aarch64(RecordTask* t, remote_code_ptr ip, bool entering_syscall);
+
+  /**
+   * Try to patch the trapping instruction that |t| just trapped on. If this
+   * returns false, patching failed and the instruction should be processed
+   * as normal. If this returns true, patching succeeded.
+   * t->ip() is the address of the trapping instruction.
+   * and execution should resume normally to execute the patched code.
+   * Zero or more mapping operations are also recorded to the trace and must
+   * be replayed.
+   */
+  bool try_patch_trapping_instruction(RecordTask* t, size_t instruction_length,
+                                      bool before_instruction,
+                                      bool &should_retry);
 
   /**
    * Replace all extended jumps by syscalls again. Note that we do not try to
@@ -99,7 +118,7 @@ public:
    * patch libpthread.so.
    */
   void patch_after_mmap(RecordTask* t, remote_ptr<void> start, size_t size,
-                        size_t offset_pages, int child_fd, MmapMode mode);
+                        size_t offset_bytes, int child_fd, MmapMode mode);
 
   /**
    * The list of pages we've allocated to hold our extended jumps.
@@ -111,13 +130,20 @@ public:
   };
   std::vector<ExtendedJumpPage> extended_jump_pages;
 
-  bool is_jump_stub_instruction(remote_code_ptr p);
+  bool is_jump_stub_instruction(remote_code_ptr p, bool include_safearea);
+  // Return the breakpoint instruction (i.e. the last branch back to caller)
+  // if we are on the exit path in the jump stub
+  remote_code_ptr get_jump_stub_exit_breakpoint(remote_code_ptr ip, RecordTask *t);
+
+  void unpatch_dl_runtime_resolves(RecordTask* t);
 
   struct patched_syscall {
     // Pointer to hook inside the syscall_hooks array, which gets initialized
-    // once and is fixed afterwars.
+    // once and is fixed afterwards.
     const syscall_patch_hook *hook;
     size_t size;
+    uint16_t safe_prefix = 0;
+    uint16_t safe_suffix = 0;
   };
 
   /**
@@ -126,6 +152,27 @@ public:
   std::map<remote_ptr<uint8_t>, patched_syscall> syscallbuf_stubs;
 
 private:
+  void patch_dl_runtime_resolve(RecordTask* t, ElfReader& reader,
+                                uintptr_t elf_addr,
+                                remote_ptr<void> map_start,
+                                size_t map_size,
+                                size_t map_offset);
+  void patch_aarch64_have_lse_atomics(RecordTask* t, ElfReader& reader,
+                                      uintptr_t elf_addr,
+                                      remote_ptr<void> map_start,
+                                      size_t map_size,
+                                      size_t map_offset);
+
+  /**
+   * `ip` is the address of the instruction that triggered the syscall or trap
+   */
+  const syscall_patch_hook* find_syscall_hook(RecordTask* t,
+                                              remote_code_ptr ip,
+                                              bool entering_syscall,
+                                              size_t instruction_length,
+                                              bool &should_retry,
+                                              bool &transient_failure);
+
   /**
    * The list of supported syscall patches obtained from the preload
    * library. Each one matches a specific byte signature for the instruction(s)
@@ -133,10 +180,12 @@ private:
    */
   std::vector<syscall_patch_hook> syscall_hooks;
   /**
-   * The addresses of the instructions following syscalls that we've tried
-   * (or are currently trying) to patch.
+   * The addresses of the instructions following syscalls or other
+   * instructions that we've tried (or are currently trying) to patch.
    */
   std::unordered_set<remote_code_ptr> tried_to_patch_syscall_addresses;
+
+  std::map<remote_ptr<uint8_t>, std::vector<uint8_t>> saved_dl_runtime_resolve_code;
 };
 
 } // namespace rr

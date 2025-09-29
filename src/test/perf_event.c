@@ -20,6 +20,7 @@ static uint64_t get_desched(void) {
 int main(void) {
   struct perf_event_attr attr;
   int i;
+  int new_counter_fd;
 
   memset(&attr, 0, sizeof(attr));
   attr.size = sizeof(attr);
@@ -27,6 +28,12 @@ int main(void) {
   attr.config = PERF_COUNT_SW_CONTEXT_SWITCHES;
 
   counter_fd = sys_perf_event_open(&attr, 0 /*self*/, -1 /*any cpu*/, -1, 0);
+  if (counter_fd < 0) {
+    test_assert(errno == EACCES);
+    atomic_puts("Skipping test because counter is not available");
+    atomic_puts("EXIT-SUCCESS");
+    return 0;
+  }
   test_assert(0 <= counter_fd);
 
   atomic_printf("num descheds: %" PRIu64 "\n", get_desched());
@@ -34,6 +41,11 @@ int main(void) {
     sched_yield();
     atomic_printf("after yield: %" PRIu64 "\n", get_desched());
   }
+
+  close(counter_fd);
+  /* Reopen the counter to make sure that rr noticed the close(). */
+  new_counter_fd = sys_perf_event_open(&attr, 0 /*self*/, -1 /*any cpu*/, -1, 0);
+  test_assert(counter_fd == new_counter_fd);
 
   atomic_puts("EXIT-SUCCESS");
   return 0;
